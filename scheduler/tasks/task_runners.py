@@ -21,13 +21,16 @@ scheduler.tasks.task_runners —— 各定时任务执行体
 """
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import List, Tuple
 
 from sqlalchemy.orm import Session
 
 from common.db.repository import Repository, run_with_retry
 from common.models.shop_models import Shop
+from common.models.setting_models import SysSetting
 
 from tasks import log_cleanup, service_client, task_run_log
 from tasks.constants import (
@@ -41,6 +44,82 @@ logger = logging.getLogger("scheduler.task_runners")
 
 # 店铺「启用」状态值（与 shop_models.Shop.status 约定一致：1=启用）。
 _SHOP_STATUS_ENABLED: int = 1
+
+# 登录态维护设置分组键与北京时间时区。
+_SETTING_KEY_LOGIN_MAINTENANCE: str = "login_maintenance"
+_BEIJING_TZ = timezone(timedelta(hours=8))
+_DEFAULT_DAILY_TIME: str = "08:00"
+
+
+def _read_login_maintenance() -> dict:
+    """读取登录态维护设置；读取失败时按默认启用处理，避免中断保活。"""
+    def _read(session):
+        record = Repository(SysSetting, session).get_by(
+            setting_key=_SETTING_KEY_LOGIN_MAINTENANCE,
+            scope="global",
+            owner_user_id=None,
+        )
+        if record is None or not record.setting_value:
+            return {}
+        try:
+            value = json.loads(record.setting_value)
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    try:
+        return run_with_retry(_read)
+    except Exception as exc:  # noqa: BLE001 - 读取失败回退默认
+        logger.warning("读取登录态维护设置失败，按默认启用处理：%s", exc)
+        return {}
+
+
+def _mark_daily_maintenance_done(today: str) -> None:
+    """记录每日维护已完成，避免同一天重复执行。"""
+    def _write(session):
+        record = Repository(SysSetting, session).get_by(
+            setting_key=_SETTING_KEY_LOGIN_MAINTENANCE,
+            scope="global",
+            owner_user_id=None,
+        )
+        if record is None:
+            return
+        try:
+            value = json.loads(record.setting_value or "{}")
+        except (ValueError, TypeError):
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        value["last_run_date"] = today
+        Repository(SysSetting, session).update(
+            record.id, setting_value=json.dumps(value, ensure_ascii=False)
+        )
+        session.commit()
+
+    try:
+        run_with_retry(_write)
+    except Exception as exc:  # noqa: BLE001 - 写日期失败不影响主流程
+        logger.warning("写入每日维护日期失败：%s", exc)
+
+
+def _maybe_write_daily_maintenance_log(config: dict, ok: int, fail: int) -> None:
+    """到达设置的每日时间且当天未执行时，补记一条「每日自动维护」执行日志。"""
+    now = datetime.now(_BEIJING_TZ)
+    raw = str(config.get("time") or _DEFAULT_DAILY_TIME)
+    try:
+        hour, minute = (int(part) for part in raw.split(":"))
+    except (ValueError, TypeError):
+        hour, minute = 8, 0
+    if (now.hour, now.minute) < (hour, minute):
+        return
+    today = now.date().isoformat()
+    if config.get("last_run_date") == today:
+        return
+    task_run_log.write_success(
+        TASK_COOKIE_REFRESH,
+        "每日 %s 自动登录态维护完成：成功 %d 个，失败 %d 个" % (raw, ok, fail),
+    )
+    _mark_daily_maintenance_done(today)
 
 
 def _list_enabled_shops(session: Session) -> List[Tuple[int, str, int | None]]:
@@ -61,7 +140,13 @@ def run_cookie_refresh() -> None:
 
     遍历全部启用店铺，逐个经 HTTP 调用 websocket 服务刷新 Cookie；汇总成功 /
     失败数量并写一条执行日志。任一店铺调用失败不中断整体遍历。
+
+    登录态维护设置中的开关关闭时跳过本轮；到达设定的每日时间时额外记录一条
+    「每日自动维护」日志（配合前端的时间设置，无需重启调度器即生效）。
     """
+    config = _read_login_maintenance()
+    if config.get("enabled") is False:
+        return
     try:
         shops = run_with_retry(_list_enabled_shops)
     except Exception as exc:  # noqa: BLE001 —— 取店铺失败：记失败日志后返回
@@ -71,6 +156,7 @@ def run_cookie_refresh() -> None:
 
     if not shops:
         task_run_log.write_success(TASK_COOKIE_REFRESH, "无启用店铺，跳过 Cookie 刷新")
+        _maybe_write_daily_maintenance_log(config, 0, 0)
         return
 
     success_count = 0
@@ -89,6 +175,7 @@ def run_cookie_refresh() -> None:
         task_run_log.write_failed(TASK_COOKIE_REFRESH, message)
     else:
         task_run_log.write_success(TASK_COOKIE_REFRESH, message)
+    _maybe_write_daily_maintenance_log(config, success_count, failed_count)
 
 
 def run_product_sync() -> None:

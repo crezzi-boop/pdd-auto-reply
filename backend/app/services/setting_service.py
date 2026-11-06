@@ -30,6 +30,7 @@ backend.app.services.setting_service —— 系统设置业务服务
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
@@ -55,6 +56,8 @@ KEY_BASIC: str = "basic"
 KEY_BRAND: str = "brand"
 KEY_DISCLAIMER: str = "disclaimer"
 KEY_QRCODES: str = "qrcodes"
+# 登录态自动维护（自动保活开关 + 每日维护时间）。
+KEY_LOGIN_MAINTENANCE: str = "login_maintenance"
 
 # 各分组的默认值：未配置时 GET 返回该默认结构，保证前端可直接渲染。
 _DEFAULTS: Dict[str, Dict[str, Any]] = {
@@ -103,6 +106,14 @@ _DEFAULTS: Dict[str, Dict[str, Any]] = {
     KEY_QRCODES: {
         # 二维码列表：每项 {type, image_url}，type 如 wechat/qq/mp/telegram。
         "items": [],
+    },
+    KEY_LOGIN_MAINTENANCE: {
+        # 是否启用自动保活（每 10 分钟检查一次登录态）。
+        "enabled": True,
+        # 每天额外做一次完整维护的时间（北京时间 HH:MM）。
+        "time": "08:00",
+        # 最近一次每日维护日期（内部使用，避免同一天重复执行）。
+        "last_run_date": "",
     },
 }
 
@@ -408,3 +419,34 @@ __all__ = [
     "is_login_captcha_enabled",
     "get_all_settings",
 ]
+
+
+# ----------------------------------------------------------------------
+# 登录态自动维护（自动保活 + 每日维护时间）
+# ----------------------------------------------------------------------
+def get_login_maintenance(session: Session) -> ApiResponse:
+    """查询登录态自动维护设置。"""
+    return success_response(
+        data=_get_group(session, KEY_LOGIN_MAINTENANCE), message="查询成功"
+    )
+
+
+def update_login_maintenance(
+    session: Session,
+    enabled: Optional[bool] = None,
+    time: Optional[str] = None,
+    *,
+    operator_id: Optional[int] = None,
+) -> ApiResponse:
+    """持久化登录态自动维护设置（时间须为 24 小时制 HH:MM）。"""
+    value: Dict[str, Any] = dict(_DEFAULTS[KEY_LOGIN_MAINTENANCE])
+    value.update(_get_group(session, KEY_LOGIN_MAINTENANCE))
+    if enabled is not None:
+        value["enabled"] = bool(enabled)
+    if time is not None:
+        text = str(time).strip()
+        if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", text):
+            return error_response(CODE_PARAM_ERROR, "时间格式须为 HH:MM（24 小时制）")
+        value["time"] = text
+    _save_value(session, KEY_LOGIN_MAINTENANCE, value, operator_id)
+    return success_response(data=value, message="登录态维护设置已保存")

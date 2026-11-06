@@ -25,6 +25,7 @@ import {
   Trash2,
   Eye,
   EyeOff,
+  RefreshCw,
 } from 'lucide-vue-next'
 import { Loading, Select } from '@/components/common'
 import { showToast, TOAST_TYPE } from '@/utils/toast'
@@ -37,6 +38,7 @@ import {
   getQrcodes, updateQrcodes,
   getSmtp, updateSmtp, sendTestEmail,
   getProxy, updateProxy,
+  getLoginMaintenance, updateLoginMaintenance,
 } from '@/api/settings_api'
 import { THEME_COLOR_PRESETS } from '@/utils/theme'
 import { useLayoutStore } from '@/store'
@@ -57,6 +59,7 @@ const smtp = reactive({ host: '', port: 465, sender_email: '', sender_name: '', 
 const showSmtpPassword = ref(false)
 const testEmail = ref('')
 const proxy = reactive({ enabled: false, api_url: '' })
+const loginMaintenance = reactive({ enabled: true, time: '08:00' })
 
 const darkModeOptions = [
   { value: 'light', label: '亮色模式' },
@@ -81,9 +84,9 @@ function assign(target, source) {
 
 async function loadAll() {
   loading.value = true
-  const [t, p, b, br, d, q, s, px] = await Promise.allSettled([
+  const [t, p, b, br, d, q, s, px, lm] = await Promise.allSettled([
     getTheme(), getPagination(), getBasic(), getBrand(), getDisclaimer(),
-    getQrcodes(), getSmtp(), getProxy(),
+    getQrcodes(), getSmtp(), getProxy(), getLoginMaintenance(),
   ])
   if (t.status === 'fulfilled') assign(theme, t.value)
   if (p.status === 'fulfilled') assign(pagination, p.value)
@@ -93,6 +96,7 @@ async function loadAll() {
   if (q.status === 'fulfilled' && q.value) qrcodes.items = q.value.items || []
   if (s.status === 'fulfilled') assign(smtp, s.value)
   if (px.status === 'fulfilled') assign(proxy, px.value)
+  if (lm.status === 'fulfilled') assign(loginMaintenance, lm.value)
   loading.value = false
 }
 
@@ -140,6 +144,9 @@ function savePagination() {
 }
 function saveBasic() {
   return runSave('basic', () => updateBasic({ ...basic, log_retention_days: Number(basic.log_retention_days) }), '基础设置已保存')
+}
+function saveLoginMaintenance() {
+  return runSave('loginMaintenance', () => updateLoginMaintenance({ enabled: loginMaintenance.enabled, time: loginMaintenance.time }), '登录态维护设置已保存')
 }
 function saveBrand() {
   return runSave('brand', () => updateBrand({ ...brand }), '品牌信息已保存')
@@ -284,6 +291,33 @@ function removeQrcode(index) {
             <input v-model="basic.log_retention_days" type="number" min="1" max="365" class="input-ios w-24 text-center" />
           </div>
           <button class="btn-ios-primary" :disabled="saving.basic" @click="saveBasic">保存基础设置</button>
+        </div>
+      </div>
+
+      <!-- 登录态自动维护 -->
+      <div class="vben-card">
+        <div class="vben-card-header">
+          <h2 class="vben-card-title"><RefreshCw class="w-4 h-4" /> 登录态自动维护</h2>
+        </div>
+        <div class="vben-card-body space-y-4">
+          <div class="flex items-center justify-between py-2">
+            <div>
+              <p class="font-medium text-slate-900 dark:text-slate-100">自动保持登录（推荐开启）</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400">系统每 10 分钟自动检查一次店铺登录态，避免长时间无操作被踢下线</p>
+            </div>
+            <label class="switch-ios">
+              <input type="checkbox" v-model="loginMaintenance.enabled" />
+              <span class="switch-slider"></span>
+            </label>
+          </div>
+          <div class="flex items-center justify-between py-2 border-t border-slate-100 dark:border-slate-700">
+            <div>
+              <p class="font-medium text-slate-900 dark:text-slate-100">每天自动维护时间</p>
+              <p class="text-sm text-slate-500 dark:text-slate-400">到点额外做一次完整检查；若登录态已失效，会在日志里提示重新扫码</p>
+            </div>
+            <input v-model="loginMaintenance.time" type="time" class="input-ios w-32 text-center" />
+          </div>
+          <button class="btn-ios-primary" :disabled="saving.loginMaintenance" @click="saveLoginMaintenance">保存登录维护设置</button>
         </div>
       </div>
 

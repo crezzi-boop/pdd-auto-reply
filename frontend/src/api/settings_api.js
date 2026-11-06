@@ -76,3 +76,11 @@ export function getProxy() {
 export function updateProxy(payload) {
   return put('/settings/proxy', payload)
 }
+
+// 登录态自动维护（自动保活开关 + 每天维护时间）
+export function getLoginMaintenance() {
+  return get('/settings/login-maintenance')
+}
+export function updateLoginMaintenance(payload) {
+  return put('/settings/login-maintenance', payload)
+}

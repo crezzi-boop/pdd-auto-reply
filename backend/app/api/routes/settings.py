@@ -95,6 +95,13 @@ class BasicRequest(BaseModel):
     log_retention_days: Optional[int] = Field(None, description="日志保留天数（1~365）")
 
 
+class LoginMaintenanceRequest(BaseModel):
+    """登录态自动维护请求体（字段可选，None 表示不修改）。"""
+
+    enabled: Optional[bool] = Field(None, description="是否启用自动保活")
+    time: Optional[str] = Field(None, description="每日维护时间 HH:MM（24 小时制）")
+
+
 class BrandRequest(BaseModel):
     """登录页品牌请求体（字段可选，None 表示不修改）。"""
 
@@ -255,6 +262,39 @@ def update_basic(
         show_default_login=payload.show_default_login,
         enable_captcha=payload.enable_captcha,
         log_retention_days=payload.log_retention_days,
+        operator_id=current_user.id,
+    )
+
+
+# ----------------------------------------------------------------------
+# 登录态自动维护（自动保活 + 每日维护时间）
+# ----------------------------------------------------------------------
+@router.get("/settings/login-maintenance", response_model=ApiResponse, summary="查询登录态维护设置")
+def get_login_maintenance(
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """查询登录态自动维护设置（管理员专属）。"""
+    denied = _ensure_admin(current_user, db)
+    if denied is not None:
+        return denied
+    return setting_service.get_login_maintenance(db)
+
+
+@router.put("/settings/login-maintenance", response_model=ApiResponse, summary="保存登录态维护设置")
+def update_login_maintenance(
+    payload: LoginMaintenanceRequest,
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """持久化登录态自动维护设置（管理员专属）。"""
+    denied = _ensure_admin(current_user, db)
+    if denied is not None:
+        return denied
+    return setting_service.update_login_maintenance(
+        db,
+        enabled=payload.enabled,
+        time=payload.time,
         operator_id=current_user.id,
     )
 

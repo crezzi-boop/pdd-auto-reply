@@ -19,6 +19,7 @@ websocket.routes.cookies —— Cookie 刷新接口（供 scheduler 调用）
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -26,9 +27,16 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from channel_pdd import pdd_login
+from channel_pdd.api.get_user_info import GetUserInfo
 from channel_pdd.core.credential_store import (
+    load_account_cookies,
     load_account_credentials,
     update_account_cookies,
+)
+from channel_pdd.core.login_state_store import (
+    LOGIN_STATE_ONLINE,
+    LOGIN_STATE_RELOGIN,
+    mark_login_state,
 )
 from common.schemas.common import ApiResponse, error_response, success_response
 
@@ -36,6 +44,40 @@ logger = logging.getLogger("websocket.routes.cookies")
 
 # Cookie 刷新路由：标签便于 OpenAPI 分组；前缀由聚合层添加。
 router = APIRouter(tags=["Cookie 刷新"])
+
+
+def _verify_cookies_alive(cookies: dict, shop_id: str, user_id: int) -> bool:
+    """用已存 Cookie 请求拼多多用户信息接口，验证登录态并顺带保活。
+
+    扫码 / Cookie 导入的店铺没有 Playwright 用户数据目录，无法走浏览器刷新；
+    此时用库中 Cookie 直接发一次请求，既验证有效性，也让会话保持活跃。
+
+    Args:
+        cookies: 已解密的 Cookie 字典。
+        shop_id: 店铺业务标识。
+        user_id: 归属用户 ID。
+
+    Returns:
+        Cookie 仍有效返回 True（并回写凭据、标记在线）；否则 False。
+    """
+    try:
+        user_info = GetUserInfo(cookies).get_user_info()
+    except Exception as exc:  # noqa: BLE001 - 校验异常一律视为失效
+        logger.warning("店铺 shop_id=%s Cookie 校验异常：%s", shop_id, exc)
+        return False
+    if not user_info or not user_info[0]:
+        return False
+    update_account_cookies(shop_id, user_id, cookies)
+    mark_login_state(shop_id, user_id, LOGIN_STATE_ONLINE)
+    return True
+
+
+def _safe_mark_relogin(shop_id: str, user_id: int) -> None:
+    """标记店铺为「需重新登录」，失败只记日志不打断响应。"""
+    try:
+        mark_login_state(shop_id, user_id, LOGIN_STATE_RELOGIN)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("店铺 shop_id=%s 标记需重新登录失败：%s", shop_id, exc)
 
 
 class RefreshCookieRequest(BaseModel):
@@ -88,8 +130,25 @@ async def refresh_cookie(payload: RefreshCookieRequest) -> ApiResponse:
         return error_response(-1, "Cookie 刷新失败，请稍后重试")
 
     if info is None:
-        logger.warning("店铺 shop_id=%s 登录态已失效，Cookie 刷新失败", payload.shop_id)
-        return error_response(-1, "登录态已失效，需重新登录")
+        # 回退：扫码 / Cookie 导入的店铺没有浏览器用户数据目录，
+        # 直接用库中已存 Cookie 做一次校验请求（同时起到保活作用）。
+        cookies = load_account_cookies(payload.shop_id, payload.owner_user_id)
+        if cookies:
+            alive = await asyncio.to_thread(
+                _verify_cookies_alive,
+                cookies,
+                payload.shop_id,
+                payload.owner_user_id,
+            )
+            if alive:
+                logger.info("店铺 shop_id=%s 使用现有 Cookie 保活成功", payload.shop_id)
+                return success_response(
+                    data={"shop_id": payload.shop_id, "shop_pk": payload.shop_pk},
+                    message="Cookie 保活成功",
+                )
+        _safe_mark_relogin(payload.shop_id, payload.owner_user_id)
+        logger.warning("店铺 shop_id=%s 登录态已失效，需重新扫码登录", payload.shop_id)
+        return error_response(-1, "登录态已失效，需重新扫码登录")
 
     # 刷新成功：将新 Cookie 加密回写 account 表（不返回明文，需求 3.6）。
     update_account_cookies(
