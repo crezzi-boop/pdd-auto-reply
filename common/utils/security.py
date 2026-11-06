@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 安全模块（common.utils.security）
 ================================
@@ -31,6 +31,18 @@ websocket / scheduler 等各服务复用，满足需求 1（用户认证与会�
   版本比对）由 backend 服务结合数据库实现，本模块仅负责签发与校验的基础。
 """
 from __future__ import annotations
+import bcrypt
+if not hasattr(bcrypt, "__about__"):
+    class _About:
+        __version__ = getattr(bcrypt, "__version__", "4.0.1")
+    bcrypt.__about__ = _About()
+_orig_hashpw = bcrypt.hashpw
+def _safe_hashpw(password, salt):
+    if isinstance(password, bytes) and len(password) > 72:
+        password = password[:72]
+    return _orig_hashpw(password, salt)
+bcrypt.hashpw = _safe_hashpw
+
 
 import uuid
 from datetime import datetime, timedelta

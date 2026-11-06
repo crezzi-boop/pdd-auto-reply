@@ -38,7 +38,7 @@ services:
       TZ: Asia/Shanghai
     ports:
       # 宿主机端口可经环境变量调整，默认 3306（仅本机调试用，生产可移除映射）
-      - "${MYSQL_HOST_PORT:-3306}:3306"
+      - "127.0.0.1:${MYSQL_HOST_PORT:-3306}:3306"
     volumes:
       # 数据持久化（禁止删除数据，规范 11）
       - mysql_data:/var/lib/mysql
@@ -70,7 +70,7 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       TZ: Asia/Shanghai
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -126,7 +126,7 @@ services:
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-change-me-internal-service-token}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
-      - "${BACKEND_WEB_PORT:-8089}:8089"
+      - "127.0.0.1:${BACKEND_WEB_PORT:-8089}:8089"
     volumes:
       # 静态资源 / 上传文件持久化（与各服务共享同一卷）
       - backend_static:/app/backend/static
@@ -183,7 +183,7 @@ services:
       # Playwright 持久化用户数据目录，须与下方挂载卷一致，确保容器重建后登录态不丢失
       PLAYWRIGHT_USER_DATA_DIR: ${PLAYWRIGHT_USER_DATA_DIR:-/app/websocket/browser_data}
     ports:
-      - "${WEBSOCKET_PORT:-8090}:8090"
+      - "127.0.0.1:${WEBSOCKET_PORT:-8090}:8090"
     volumes:
       - backend_static:/app/backend/static
       # 浏览器持久化数据（Playwright launch_persistent_context）
@@ -234,7 +234,7 @@ services:
       DATA_ENCRYPT_KEY: ${DATA_ENCRYPT_KEY:-change-me-data-encrypt-key}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     ports:
-      - "${SCHEDULER_PORT:-8091}:8091"
+      - "127.0.0.1:${SCHEDULER_PORT:-8091}:8091"
     volumes:
       - backend_static:/app/backend/static
     networks:
