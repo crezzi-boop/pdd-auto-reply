@@ -57,6 +57,13 @@ _CHROMIUM_ARGS: List[str] = [
     "--disable-features=VizDisplayCompositor",
 ]
 
+# 真实 Chrome User-Agent：Playwright 默认 UA 含 "HeadlessChrome"，拼多多商家后台
+# 会据此弹出「浏览器不是 chrome 浏览器」全屏拦截弹窗，遮挡所有点击，需显式覆盖。
+_CHROME_USER_AGENT: str = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
 # 登录等待超时默认值（毫秒）：预留人工完成验证码 / 滑块的时间（需求 4.2 / 4.5）。
 _DEFAULT_LOGIN_WAIT_TIMEOUT_MS: int = 120_000
 
@@ -181,6 +188,7 @@ async def _launch_persistent_context_with_retry(
                 user_data_dir,
                 headless=headless,
                 args=_CHROMIUM_ARGS,
+                user_agent=_CHROME_USER_AGENT,
             )
             if attempt > 1:
                 logger.info("账号 '%s' 第 %s 次尝试启动浏览器成功", name, attempt)
@@ -223,6 +231,22 @@ def _login_wait_timeout_ms() -> int:
     return _DEFAULT_LOGIN_WAIT_TIMEOUT_MS
 
 
+async def _dismiss_login_modal(page: Any, name: str) -> None:
+    """关闭拼多多登录页的「非 Chrome 浏览器」提示弹窗（存在时），避免遮挡点击。
+
+    Args:
+        page: 已打开登录页的 Playwright 页面。
+        name: 登录账号名（仅用于日志）。
+    """
+    try:
+        dismiss = page.locator("button:has-text('已安装去使用')")
+        if await dismiss.count() > 0:
+            await dismiss.first.click(timeout=5_000)
+            logger.info("账号 '%s' 已关闭浏览器提示弹窗", name)
+    except Exception as exc:  # noqa: BLE001 - 关闭失败不打断登录主流程
+        logger.warning("账号 '%s' 关闭提示弹窗失败（可忽略）: %s", name, exc)
+
+
 async def login_with_password(name: str, password: str) -> Optional[str]:
     """使用账号密码通过 Playwright 登录拼多多商家后台并导出 Cookie（需求 4.1 / 4.2 / 4.5）。
 
@@ -245,6 +269,7 @@ async def login_with_password(name: str, password: str) -> Optional[str]:
     async with _get_login_semaphore():
         playwright = None
         context = None
+        page = None
         try:
             playwright = await async_playwright().start()
             context = await _launch_persistent_context_with_retry(
@@ -252,9 +277,17 @@ async def login_with_password(name: str, password: str) -> Optional[str]:
             )
             page = await context.new_page()
 
-            # 打开登录页并切换到「账号登录」。
-            await page.goto(PDD_LOGIN_URL)
-            await page.click("div.Common_item__3diIn:has-text('账号登录')")
+            # 打开登录页；页面可能弹出「建议使用 Chrome 浏览器」全屏拦截弹窗，
+            # 需先关闭，否则后续所有点击都会被拦截。
+            await page.goto(PDD_LOGIN_URL, wait_until="domcontentloaded")
+            await _dismiss_login_modal(page, name)
+
+            # 账号登录输入框通常默认已渲染；仅在缺失时才点击「账号登录」标签，
+            # 避免弹窗 / 页面改版导致点击超时。
+            if await page.locator("input[type='text']").count() == 0:
+                await page.click(
+                    "div.Common_item__3diIn:has-text('账号登录')", timeout=10_000
+                )
 
             # 等待输入框出现后填入账号密码并提交。
             await page.wait_for_selector("input[type='text']")
@@ -262,21 +295,31 @@ async def login_with_password(name: str, password: str) -> Optional[str]:
             await page.fill("input[type='password']", password)
             await page.click("button:has-text('登录')")
 
-            # 等待登录成功（title 命中成功集合）。期间用户可人工完成验证码 / 滑块
-            # （需求 4.2）；超时（含未完成人工验证）则判定失败（需求 4.5）。
-            title_condition = (
-                "() => "
+            # 登录成功后会离开 /login 跳转商家后台首页；登录页 title 本身也含
+            # 「商家后台」，因此不能仅凭 title 判断（会误判为已登录）。
+            # 超时（含需要人工短信 / 滑块验证）则判定失败（需求 4.5）。
+            success_condition = (
+                "() => !location.href.toLowerCase().includes('/login')"
+                " || "
                 + " || ".join(
                     f"document.title === '{title}'" for title in _SUCCESS_TITLES
                 )
             )
-            await page.wait_for_function(title_condition, timeout=wait_timeout)
+            await page.wait_for_function(success_condition, timeout=wait_timeout)
 
             cookies_json = _cookies_list_to_json(await context.cookies())
             logger.info("账号 '%s' 账号密码登录成功，已导出 Cookie", name)
             return cookies_json
         except Exception as exc:  # noqa: BLE001 - 登录异常统一降级为失败返回
-            logger.error("账号 '%s' 账号密码登录失败: %s", name, exc)
+            try:
+                state = (
+                    "url=%s, title=%s" % (page.url, await page.title())
+                    if page is not None
+                    else "页面未创建"
+                )
+            except Exception:  # noqa: BLE001 - 状态采集失败不影响失败返回
+                state = "页面状态不可用"
+            logger.error("账号 '%s' 账号密码登录失败（%s）: %s", name, state, exc)
             return None
         finally:
             await _safe_close(context, playwright)

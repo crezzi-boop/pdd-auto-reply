@@ -182,6 +182,7 @@ services:
       MAX_CAPTCHA_CONCURRENT: ${MAX_CAPTCHA_CONCURRENT:-1}
       # Playwright 持久化用户数据目录，须与下方挂载卷一致，确保容器重建后登录态不丢失
       PLAYWRIGHT_USER_DATA_DIR: ${PLAYWRIGHT_USER_DATA_DIR:-/app/websocket/browser_data}
+      PDD_LOGIN_WAIT_TIMEOUT_MS: ${PDD_LOGIN_WAIT_TIMEOUT_MS:-120000}
     ports:
       - "127.0.0.1:${WEBSOCKET_PORT:-8090}:8090"
     volumes:
