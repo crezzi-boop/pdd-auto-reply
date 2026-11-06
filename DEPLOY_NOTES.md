@@ -17,6 +17,7 @@
 | 后端启动即崩溃、登录校验失败 | `passlib 1.7.4` 与新版 `bcrypt 5.x` 不兼容 | `common/pyproject.toml` 锁定 `bcrypt==4.0.1`；`common/utils/security.py` 增加兼容补丁 |
 | 前端容器无限重启 | `frontend/nginx.conf` 含 UTF-8 BOM，nginx 报 unknown directive | 移除 BOM |
 | MySQL/Redis/后端端口公网裸奔 | 默认 compose 映射到 0.0.0.0，且使用默认弱口令 | `docker-compose.yml` 改为 `127.0.0.1:` 前缀；所有默认口令改为随机强密码 |
+| 登录页报「网络异常」，所有接口 404 | 仓库缺少 `frontend/.env.production`，`VITE_API_BASE_URL` 回退成 `/api`，而后端 111 个路由都在 `/api/v1` 下 | 补 `frontend/.env.production` 设 `VITE_API_BASE_URL=/api/v1`；`request.js` 回退值同步改为 `/api/v1`；`nginx.conf` 给 index.html 加 no-cache |
 
 ## 日常运维
 
