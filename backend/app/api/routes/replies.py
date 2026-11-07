@@ -5,9 +5,10 @@ backend.app.api.routes.replies —— 默认回复与商品专属回复接口路
 本文件用途：提供 backend 服务的「默认回复」与「商品专属回复」REST 接口，满足
 需求 7（默认回复与商品专属回复）：
 
-默认回复（按店铺维度一条配置）：
+默认回复（按店铺维度一条配置，可含多条兜底语句）：
 - ``GET    /default-replies``        查询某店铺默认回复配置（需求 7.1 配套）。
-- ``PUT    /default-replies``        保存（upsert）默认回复配置（需求 7.1）。
+- ``PUT    /default-replies``        保存（upsert）默认回复配置（需求 7.1）；
+  ``contents`` 为多条语句数组，``rotate_minutes`` 为不重复轮换窗口（默认 10 分钟）。
 - ``PUT    /default-replies/status`` 启用 / 停用默认回复。
 
 商品专属回复（绑定 goods_id，优先级高于默认，需求 7.2/7.4）：
@@ -27,7 +28,7 @@ backend.app.api.routes.replies —— 默认回复与商品专属回复接口路
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
@@ -40,6 +41,7 @@ from app.services import reply_service
 from common.db.session import get_db
 from common.models.user_models import SysUser
 from common.schemas.common import ApiResponse, error_response
+from common.services.default_reply_variants import DEFAULT_ROTATE_MINUTES
 
 # 默认回复与商品专属回复路由：标签便于 OpenAPI 文档分组；前缀由聚合层添加。
 router = APIRouter(tags=["默认回复与商品专属回复"])
@@ -71,10 +73,16 @@ def _ensure_permission(
 # 请求体模型
 # ----------------------------------------------------------------------
 class SaveDefaultReplyRequest(BaseModel):
-    """保存默认回复请求体。"""
+    """保存默认回复请求体（支持多条语句 + 不重复轮换）。"""
 
     shop_pk: int = Field(..., description="店铺主键 shop.id")
-    content: str = Field(..., description="默认回复内容")
+    content: str = Field("", description="兼容旧版的单条默认回复内容")
+    contents: Optional[List[str]] = Field(
+        None, description="用户手工输入的多条默认回复语句（最多 20 条）"
+    )
+    rotate_minutes: int = Field(
+        DEFAULT_ROTATE_MINUTES, description="不重复轮换窗口（分钟，1-120，默认 10）"
+    )
     enabled: bool = Field(True, description="是否启用")
     reply_once: bool = Field(
         False, description="是否只回复一次（同一客户仅发送一次默认回复）"
@@ -144,6 +152,8 @@ def save_default_reply(
         content=payload.content,
         enabled=payload.enabled,
         reply_once=payload.reply_once,
+        contents=payload.contents,
+        rotate_minutes=payload.rotate_minutes,
     )
 
 

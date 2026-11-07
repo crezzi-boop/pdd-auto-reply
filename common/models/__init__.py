@@ -61,6 +61,7 @@ from common.models.log_models import (
 from common.models.reply_models import (
     DefaultReply,
     DefaultReplyRecord,
+    DefaultReplyRotationRecord,
     GoodsReply,
     KeywordRule,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "KeywordRule",
     "DefaultReply",
     "DefaultReplyRecord",
+    "DefaultReplyRotationRecord",
     "GoodsReply",
     # 知识库与商品
     "ProductKnowledge",

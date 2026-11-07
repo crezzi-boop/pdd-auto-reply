@@ -4,15 +4,15 @@
 //       后端地址经环境变量配置（禁止写死 localhost，规范 21）。
 import { get, post, put, del } from '@/utils/request'
 
-// -------------------- 默认回复（按店铺一条配置） --------------------
+// -------------------- 默认回复（按店铺一条配置，可含多条语句） --------------------
 
-// 查询某店铺默认回复配置（需求 7.1 配套）
+// 查询某店铺默认回复配置（返回 contents 多条数组 + rotate_minutes 轮换窗口）
 export function fetchDefaultReply(shopPk) {
   return get('/default-replies', { shop_pk: shopPk })
 }
 
-// 保存（upsert）某店铺默认回复配置（需求 7.1）
-// payload: { shop_pk, content, enabled?, reply_once? }
+// 保存（upsert）某店铺默认回复配置
+// payload: { shop_pk, contents: string[], content?, rotate_minutes?, enabled?, reply_once? }
 export function saveDefaultReply(payload) {
   return put('/default-replies', payload)
 }

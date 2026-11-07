@@ -33,7 +33,7 @@ import asyncio
 import json
 import logging
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
@@ -61,7 +61,13 @@ from common.models.reply_models import (
     GoodsReply,
     KeywordRule,
 )
+from common.services.default_reply_variants import (
+    DEFAULT_ROTATE_MINUTES,
+    decode_variants,
+    normalize_rotate_minutes,
+)
 from common.utils.time_utils import now_beijing, now_beijing_naive
+from engine.default_reply_rotation import DefaultReplyRotator, RotationChoice
 from engine.keyword_matcher import REPLY_IMAGE, REPLY_TEXT
 from engine.reply_engine import (
     ACTION_AI,
@@ -221,6 +227,23 @@ def load_shop_runtime(shop_pk: int, session: Any) -> ShopRuntime:
     agent_config = AgentConfig.from_llm_config(llm) if llm is not None else None
     ai_enabled = bool(agent_config.ai_enabled) if agent_config is not None else False
 
+    # 默认回复：新版可配置多条语句（contents 为 JSON 文本），旧版单条自动兼容为
+    # 长度 1 的列表；轮换窗口缺省 10 分钟。发送前由轮换器在窗口内挑不同语句，
+    # 避免拼多多对重复回复做拦截（见 engine.default_reply_rotation）。
+    default_variants = (
+        decode_variants(
+            _attr(default_reply, "contents", None),
+            _attr(default_reply, "content", None),
+        )
+        if default_reply
+        else []
+    )
+    rotate_minutes = (
+        normalize_rotate_minutes(_attr(default_reply, "rotate_minutes", None))
+        if default_reply
+        else DEFAULT_ROTATE_MINUTES
+    )
+
     shop_config = ShopConfig(
         shop_pk=shop_pk,
         business_enabled=bool(_attr(business, "enabled", True)) if business else True,
@@ -231,7 +254,9 @@ def load_shop_runtime(shop_pk: int, session: Any) -> ShopRuntime:
         shop_reply_limit=_attr(risk, "shop_reply_limit") if risk else None,
         window_seconds=_attr(risk, "window_seconds") if risk else None,
         ai_enabled=ai_enabled,
-        default_reply_content=_attr(default_reply, "content") if default_reply else None,
+        default_reply_content=default_variants[0] if default_variants else None,
+        default_reply_contents=default_variants,
+        default_reply_rotate_minutes=rotate_minutes,
         default_reply_once=bool(_attr(default_reply, "reply_once", False)) if default_reply else False,
     )
 
@@ -289,6 +314,7 @@ class MessageConsumer:
         notifier: Optional[Notifier] = None,
         default_reply_record_reader: Optional[DefaultReplyRecordReader] = None,
         default_reply_record_writer: Optional[DefaultReplyRecordWriter] = None,
+        default_reply_rotator: Optional[DefaultReplyRotator] = None,
         chat_message_writer: Optional[ChatMessageWriter] = None,
         chat_history_reader: Optional[ChatHistoryReader] = None,
         product_context_reader: Optional[
@@ -312,6 +338,8 @@ class MessageConsumer:
                 经 common 仓储查询客户是否已收到过默认回复）。
             default_reply_record_writer: 默认回复「只回复一次」记录写入器（缺省
                 经 common 仓储登记客户已收到默认回复）。
+            default_reply_rotator: 默认回复多语句轮换器（缺省经 MySQL 记录窗口内
+                发送过的语句，保证同一店铺窗口内每次默认回复换用不同语句）。
         """
         self.shop_id = shop_id
         self.shop_pk = shop_pk
@@ -330,6 +358,7 @@ class MessageConsumer:
         self._default_reply_record_writer = (
             default_reply_record_writer or self._default_record_writer
         )
+        self._default_reply_rotator = default_reply_rotator or DefaultReplyRotator()
         self._chat_message_writer = (
             chat_message_writer or self._default_chat_message_writer
         )
@@ -509,6 +538,13 @@ class MessageConsumer:
 
         # 8) 需发送回复（关键词 / 商品专属文本 / 默认回复）：发送并记日志
         if decision.should_reply and decision.content:
+            # 默认回复先做多语句轮换：同一店铺在设定窗口内每次使用不同语句，
+            # 避免拼多多对重复回复做拦截导致回复超时（AI 失败回退见 _handle_ai）。
+            rotation_choice: Optional[RotationChoice] = None
+            if decision.action == ACTION_DEFAULT:
+                rotation_choice = self._rotate_default_reply(runtime)
+                if rotation_choice is not None:
+                    decision = replace(decision, content=rotation_choice.text)
             sent = await self._send_reply(customer_uid, decision.reply_type, decision.content)
             if sent:
                 self._track_reply(customer_uid)
@@ -520,6 +556,8 @@ class MessageConsumer:
                     and customer_uid is not None
                 ):
                     self._record_default_reply_sent(customer_uid)
+            elif rotation_choice is not None:
+                self._release_rotation(rotation_choice)
             self._write_message_log(
                 customer_uid, log_content, decision.log_result, decision.content
             )
@@ -578,22 +616,32 @@ class MessageConsumer:
         )
 
         sent = False
+        reply_content = result.content
+        rotation_choice: Optional[RotationChoice] = None
         if result.content:
-            sent = await self._send_reply(customer_uid, REPLY_TEXT, result.content)
+            # AI 失败回退默认回复时同样参与多语句轮换：回退文本本质上也是默认
+            # 回复，若不轮换同样会触发拼多多的重复回复拦截。
+            if result.used_default:
+                rotation_choice = self._rotate_default_reply(runtime)
+                if rotation_choice is not None:
+                    reply_content = rotation_choice.text
+            sent = await self._send_reply(customer_uid, REPLY_TEXT, reply_content)
             if sent:
                 self._track_reply(customer_uid)
+            elif rotation_choice is not None:
+                self._release_rotation(rotation_choice)
         self._write_message_log(
             customer_uid,
             self._resolve_log_content(context, text),
             result.log_result,
-            result.content,
+            reply_content,
         )
         return ProcessOutcome(
             handled=True,
             action=ACTION_AI,
             replied=sent,
             log_result=result.log_result,
-            content=result.content,
+            content=reply_content,
         )
 
     @staticmethod
@@ -885,6 +933,37 @@ class MessageConsumer:
             self._default_reply_record_writer(self.shop_pk, str(customer_uid))
         except Exception as exc:  # noqa: BLE001 - 写记录失败不中断主流程
             logger.error("写入默认回复记录失败: shop_id=%s, %s", self.shop_id, exc)
+
+    # ------------------------------------------------------------------
+    # 默认回复多语句轮换（窗口内不重复，避免拼多多重复拦截）
+    # ------------------------------------------------------------------
+    def _rotate_default_reply(
+        self, runtime: ShopRuntime
+    ) -> Optional[RotationChoice]:
+        """在发送默认回复前挑一条「窗口内未发过」的语句。
+
+        未配置多条、轮换器异常或未落库时返回 None，上层回退使用原有单条回复，
+        保证轮换功能不会阻断正常回复。
+
+        Args:
+            runtime: 当前店铺的运行时配置。
+
+        Returns:
+            选句结果；无需 / 无法轮换时返回 None。
+        """
+        config = runtime.shop_config
+        variants = config.default_reply_contents or (
+            [config.default_reply_content] if config.default_reply_content else []
+        )
+        if not variants:
+            return None
+        return self._default_reply_rotator.pick(
+            self.shop_pk, variants, config.default_reply_rotate_minutes
+        )
+
+    def _release_rotation(self, choice: Optional[RotationChoice]) -> None:
+        """默认回复发送失败时释放轮换名额（避免占用窗口内语句）。"""
+        self._default_reply_rotator.release(choice)
 
     # ------------------------------------------------------------------
     # 延迟构造的外部依赖

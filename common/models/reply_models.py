@@ -4,7 +4,8 @@ common.models.reply_models —— 回复规则数据表模型
 ================================================
 本文件用途：定义「拼多多自动回复」系统回复规则业务域的数据表结构模型，覆盖：
 - keyword_rule   关键词规则（匹配方式 / 回复类型 / 优先级 / 启停用）
-- default_reply  默认回复（兜底回复内容 / 启停用）
+- default_reply  默认回复（多条兜底语句 / 轮换窗口 / 启停用）
+- default_reply_rotation_record  默认回复轮换发送记录（窗口内不重复）
 - goods_reply    商品专属回复（绑定 goods_id，优先级高于默认）
 
 关键约束（开发规范）：
@@ -66,16 +67,22 @@ class DefaultReply(AuditMixin, Base):
     店铺兜底回复内容，当关键词 / 商品专属 / AI 均未命中时使用（需求 7.1）。
     支持「只回复一次」：开启后同一客户在本店铺只会收到一次默认回复（参照参考
     项目 xianyu-auto-reply-wangpan 的 reply_once 设置）。
+
+    多语句轮换（防拼多多重复拦截）：``contents`` 以 JSON 数组文本保存用户手工
+    填写的多条兜底语句，``content`` 恒为其中第一条（兼容历史单条配置及其它
+    读取方）；``rotate_minutes`` 为「同一店铺窗口内每次默认回复不重复」的窗口
+    分钟数，默认 10 分钟。两个字段均为可空新列，由启动自检迁移器自动补齐，
+    历史数据无需改动即可按单条回复继续工作。
     """
 
     __tablename__ = "pdd_default_reply"
-    __table_args__ = {"comment": "默认回复表（店铺兜底回复内容 / 启停用 / 只回复一次）"}
+    __table_args__ = {"comment": "默认回复表（多条兜底语句 / 轮换窗口 / 启停用 / 只回复一次）"}
 
     shop_pk: Mapped[int] = mapped_column(
         BigInteger, nullable=False, comment="关联店铺主键 shop.id（普通列，无外键）"
     )
     content: Mapped[str] = mapped_column(
-        Text, nullable=False, comment="默认回复内容"
+        Text, nullable=False, comment="默认回复内容（多条配置中的第一条，兼容历史数据）"
     )
     enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False, comment="是否启用"
@@ -83,6 +90,14 @@ class DefaultReply(AuditMixin, Base):
     # 只回复一次：True 时同一客户在本店铺仅首次触发默认回复，后续不再发送
     reply_once: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, comment="是否只回复一次（同一客户仅发送一次默认回复）"
+    )
+    # 多条兜底语句（JSON 数组文本）：为空 / NULL 时回退到 content 单条。
+    contents: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="多条默认回复语句（JSON 数组文本；为空时按 content 单条处理）"
+    )
+    # 不重复轮换窗口（分钟）：同一店铺在该窗口内每次默认回复使用不同语句。
+    rotate_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="默认回复不重复轮换窗口（分钟，默认 10）"
     )
 
 
@@ -102,6 +117,28 @@ class DefaultReplyRecord(AuditMixin, Base):
     )
     customer_uid: Mapped[str] = mapped_column(
         String(64), nullable=False, comment="已收到默认回复的客户唯一标识"
+    )
+
+
+class DefaultReplyRotationRecord(AuditMixin, Base):
+    """默认回复轮换发送记录表 default_reply_rotation_record。
+
+    记录「某店铺在某个时刻发送了哪条默认回复语句」，用于支撑「同一店铺 10 分钟
+    内每次默认回复换用不同语句」的防重复拦截策略。以语句指纹 ``variant_key``
+    标识语句（由 common.services.default_reply_variants.variant_key 生成），
+    ``created_at`` 为北京时间发送时刻；超过窗口的记录由轮换器自动清理。
+
+    普通列、无外键（规范 10），关系由代码维护。
+    """
+
+    __tablename__ = "pdd_default_reply_rotation_record"
+    __table_args__ = {"comment": "默认回复轮换发送记录（时间窗口内避免重复语句）"}
+
+    shop_pk: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, index=True, comment="关联店铺主键 shop.id（普通列，无外键）"
+    )
+    variant_key: Mapped[str] = mapped_column(
+        String(64), nullable=False, comment="默认回复语句指纹（sha1 前 16 位）"
     )
 
 
@@ -136,5 +173,6 @@ __all__ = [
     "KeywordRule",
     "DefaultReply",
     "DefaultReplyRecord",
+    "DefaultReplyRotationRecord",
     "GoodsReply",
 ]

@@ -40,10 +40,11 @@ websocket.engine.reply_engine —— 自动回复决策链编排（纯逻辑）
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, List, Optional
 
+from common.services.default_reply_variants import DEFAULT_ROTATE_MINUTES
 from engine.business_hours import TimeLike, is_within_business_hours
 from engine.keyword_matcher import REPLY_TEXT, match_keyword
 from engine.message_filter import is_blacklisted, match_filter_rules
@@ -96,7 +97,11 @@ class ShopConfig:
         session_reply_times: 当前会话窗口内的历史回复时刻序列。
         shop_reply_times: 当前店铺窗口内的历史回复时刻序列。
         ai_enabled: AI 智能回复是否启用（需求 8.1）。
-        default_reply_content: 默认回复内容（空 / None 视为未配置默认回复，需求 7.2）。
+        default_reply_content: 默认回复内容（多条配置中的第一条；空 / None 视为
+            未配置默认回复，需求 7.2）。
+        default_reply_contents: 用户手工配置的多条默认回复语句（供发送前轮换选句，
+            避免拼多多重复拦截）；为空时按 ``default_reply_content`` 单条处理。
+        default_reply_rotate_minutes: 不重复轮换窗口（分钟，默认 10）。
         default_reply_type: 默认回复类型（text 文本 / image 图片，默认 text）。
         default_reply_once: 默认回复是否「只回复一次」（同一客户仅发送一次，需求 7.1）。
         default_reply_already_sent: 当前客户在本店铺是否已收到过默认回复（由上层
@@ -115,6 +120,8 @@ class ShopConfig:
     shop_reply_times: Optional[Iterable[datetime]] = None
     ai_enabled: bool = False
     default_reply_content: Optional[str] = None
+    default_reply_contents: List[str] = field(default_factory=list)
+    default_reply_rotate_minutes: int = DEFAULT_ROTATE_MINUTES
     default_reply_type: str = REPLY_TEXT
     default_reply_once: bool = False
     default_reply_already_sent: bool = False

@@ -5,10 +5,10 @@ backend.app.services.reply_service —— 默认回复与商品专属回复业�
 本文件用途：实现 backend 服务的「默认回复」与「商品专属回复」业务逻辑，供
 replies 路由复用，满足需求 7（默认回复与商品专属回复）：
 
-- 默认回复（default_reply 表，按店铺维度一条配置）：
+- 默认回复（default_reply 表，按店铺维度一条配置，可含多条兜底语句）：
   * ``get_default_reply(...)``：查询某店铺的默认回复配置（需求 7.1 配套）。
-  * ``save_default_reply(...)``：保存（upsert）某店铺的默认回复内容与启停用，
-    同 ``shop_pk`` 幂等更新而非新建（需求 7.1）。
+  * ``save_default_reply(...)``：保存（upsert）某店铺的多条默认回复语句、不重复
+    轮换窗口与启停用，同 ``shop_pk`` 幂等更新而非新建（需求 7.1）。
   * ``set_default_reply_status(...)``：启用 / 停用默认回复。
 - 商品专属回复（goods_reply 表，绑定 goods_id，优先级高于默认，需求 7.2/7.4）：
   * ``create_goods_reply(...)``：新增 / upsert 商品专属回复（绑定 goods_id，
@@ -49,6 +49,14 @@ from common.models.reply_models import DefaultReply, GoodsReply
 from common.models.shop_models import Shop
 from common.models.user_models import SysUser
 from common.schemas.common import ApiResponse, error_response, success_response
+from common.services.default_reply_variants import (
+    MAX_VARIANTS,
+    MAX_VARIANT_LENGTH,
+    decode_variants,
+    encode_variants,
+    normalize_rotate_minutes,
+    normalize_variants,
+)
 from common.utils.time_utils import safe_isoformat
 
 # 允许的回复类型（枚举键，与 sys_dict 的 reply_type 字典一致，需求 24.7）。
@@ -61,16 +69,26 @@ ALLOWED_REPLY_TYPES: Tuple[str, ...] = ("text", "image")
 def serialize_default_reply(reply: DefaultReply) -> Dict[str, Any]:
     """将默认回复模型序列化为对外字典。
 
+    ``contents`` 恒返回多条语句列表（历史单条配置自动转换为长度为 1 的列表），
+    ``content`` 恒为其中第一条，保证旧版前端 / 其它调用方不受影响。
+
     Args:
         reply: 默认回复模型实例。
 
     Returns:
-        默认回复信息字典（含店铺主键、内容、启停用与审计时间）。
+        默认回复信息字典（含店铺主键、多条内容、轮换窗口、启停用与审计时间）。
     """
+    variants = decode_variants(
+        getattr(reply, "contents", None), getattr(reply, "content", None)
+    )
     return {
         "id": reply.id,
         "shop_pk": reply.shop_pk,
-        "content": reply.content,
+        "content": variants[0] if variants else (reply.content or ""),
+        "contents": variants,
+        "rotate_minutes": normalize_rotate_minutes(
+            getattr(reply, "rotate_minutes", None)
+        ),
         "enabled": bool(reply.enabled),
         "reply_once": bool(getattr(reply, "reply_once", False)),
         "created_at": safe_isoformat(reply.created_at),
@@ -169,43 +187,66 @@ def save_default_reply(
     session: Session,
     user: SysUser,
     shop_pk: int,
-    content: str,
+    content: str = "",
     enabled: bool = True,
     reply_once: bool = False,
+    contents: Optional[List[Any]] = None,
+    rotate_minutes: Any = None,
 ) -> ApiResponse:
-    """保存（upsert）某店铺的默认回复配置（需求 7.1）。
+    """保存（upsert）某店铺的多条默认回复配置（需求 7.1 + 多语句轮换）。
 
-    同 ``shop_pk`` 幂等更新而非新建（每店铺仅一条默认回复配置）。内容不可为空。
+    同 ``shop_pk`` 幂等更新而非新建（每店铺仅一条默认回复配置）。新版前端传
+    ``contents`` 多条语句；旧版仅传 ``content`` 单条时自动兼容为一条。语句会
+    去除空行与重复项，最多 20 条、单条最多 1000 字。
 
     Args:
         session: 数据库会话。
         user: 当前登录用户。
         shop_pk: 店铺主键 shop.id。
-        content: 默认回复内容。
+        content: 兼容旧版的单条默认回复内容。
         enabled: 是否启用，默认 True。
         reply_once: 是否只回复一次（同一客户仅发送一次默认回复），默认 False。
+        contents: 用户手工输入的多条默认回复语句；None 表示按 ``content`` 单条处理。
+        rotate_minutes: 不重复轮换窗口（分钟，1-120，默认 10）。
 
     Returns:
-        统一响应体：成功返回保存后的默认回复配置。
+        统一响应体：成功返回保存后的默认回复配置（含 ``contents`` 列表）。
     """
     _, denied = _resolve_shop_in_scope(session, user, shop_pk)
     if denied is not None:
         return denied
-    if not content or not content.strip():
+
+    submitted = contents if contents is not None else [content]
+    if len(submitted) > MAX_VARIANTS:
+        return error_response(
+            CODE_PARAM_ERROR, f"最多可填写 {MAX_VARIANTS} 条默认回复，请删减后再保存"
+        )
+    for item in submitted:
+        if item is not None and len(str(item).strip()) > MAX_VARIANT_LENGTH:
+            return error_response(
+                CODE_PARAM_ERROR, f"单条默认回复不能超过 {MAX_VARIANT_LENGTH} 字"
+            )
+    variants = normalize_variants(submitted, content)
+    if not variants:
         return error_response(CODE_PARAM_ERROR, "默认回复内容不能为空")
 
     reply = Repository(DefaultReply, session).upsert(
         biz_keys={"shop_pk": shop_pk},
         values={
-            "content": content.strip(),
+            # content 恒为第一条，兼容历史数据与其它读取方。
+            "content": variants[0],
+            "contents": encode_variants(variants),
+            "rotate_minutes": normalize_rotate_minutes(rotate_minutes),
             "enabled": bool(enabled),
             "reply_once": bool(reply_once),
             "created_by": user.id,
         },
     )
-    return success_response(
-        data=serialize_default_reply(reply), message="保存成功"
-    )
+    ignored = len(submitted) - len(variants)
+    message = f"已保存 {len(variants)} 条默认回复"
+    if ignored > 0:
+        message += f"（已忽略 {ignored} 条空内容或重复内容）"
+    return success_response(data=serialize_default_reply(reply), message=message)
 
 
 def set_default_reply_status(

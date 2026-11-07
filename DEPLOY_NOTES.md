@@ -48,6 +48,23 @@ sudo docker compose --env-file .env down           # 停止
 
 ## 业务接入提醒
 
-- 店铺请用后台「Cookie 导入」，服务器无图形界面，不要用账号密码登录
+- 店铺请用后台「扫码登录（推荐）」或「Cookie 导入」，服务器无图形界面，不要用账号密码登录
 - AI 模型请在后台「拉取模型列表」选择当前可用模型，`gemini-1.5-*` 等旧模型名已下线
-- 店铺 Cookie 会过期，失效后重新导入一次即可
+- 店铺 Cookie 会过期，可开启「系统设置 → 登录态自动维护」每日自动保活
+
+## 默认回复多条轮换（2026-11-07 新增）
+
+拼多多会拦截短时间内的重复回复，原系统每店铺只能填一条默认回复。现改为：
+
+- 后台「店铺管理 → 设置 → 默认与商品回复」可手工增删多条默认回复（最多 20 条、单条 ≤1000 字）
+- 可设置「轮换时间」（1-120 分钟，默认 10）：同一店铺在该窗口内每次默认回复换用一条没发过的语句
+- 窗口内语句全部用过后，自动选最久未用的一条并追加不可见的零宽字符变化，保证文本不重复
+- AI 回复失败回退默认回复时同样参与轮换
+- 发送历史落在 `pdd_default_reply_rotation_record` 表，容器重启不丢；过期记录自动清理
+- 新增列 `pdd_default_reply.contents` / `rotate_minutes` 与轮换记录表由 backend 启动自检迁移器自动补齐，历史单条配置无需改动
+
+涉及文件：`common/services/default_reply_variants.py`（公共纯逻辑）、
+`websocket/engine/default_reply_rotation.py`（轮换器）、`common/models/reply_models.py`、
+`backend/app/services/reply_service.py`、`backend/app/api/routes/replies.py`、
+`websocket/engine/reply_engine.py`、`websocket/engine/message_consumer.py`、
+`frontend/src/components/shop_settings/DefaultReplyPanel.vue`。
