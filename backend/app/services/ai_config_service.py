@@ -38,6 +38,7 @@ from common.services.ai_provider_service import (
     fetch_model_list,
     get_default_ai_base_url,
     list_provider_options,
+    normalize_ai_model,
     normalize_ai_provider_type,
     test_ai_connection,
 )
@@ -151,7 +152,9 @@ def save_ai_config(
     provider = normalize_ai_provider_type(provider_type, api_base, model_name)
     # API 地址留空时回退该接口类型的默认地址，避免存空导致后续调用缺地址。
     base = (str(api_base).strip() if api_base else "") or get_default_ai_base_url(provider)
-    model = str(model_name).strip() if model_name else None
+    raw_model = str(model_name).strip() if model_name else None
+    # 保存时即把已下线的 Gemini 模型改写为当前可用模型，避免实际回复失败。
+    model = normalize_ai_model(provider, raw_model) if raw_model else None
     instr = str(instructions) if instructions is not None else None
 
     # 启用 AI 时需具备最小可用配置：模型名（dashscope_app 除外）与密钥（新建时）。

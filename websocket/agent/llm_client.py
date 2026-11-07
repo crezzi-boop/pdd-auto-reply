@@ -255,7 +255,10 @@ class LLMClient:
         """Anthropic Claude 协议纯对话调用（/v1/messages）。"""
         import httpx
 
-        from common.services.ai_provider_service import AI_PROVIDER_DEFAULT_BASE_URLS
+        from common.services.ai_provider_service import (
+            AI_PROVIDER_DEFAULT_BASE_URLS,
+            normalize_ai_model,
+        )
 
         system_content, turns = self._split_system_and_turns(messages)
         base = (self.api_base or AI_PROVIDER_DEFAULT_BASE_URLS["anthropic"]).rstrip("/")
@@ -300,7 +303,8 @@ class LLMClient:
         system_content, turns = self._split_system_and_turns(messages)
         base = (self.api_base or AI_PROVIDER_DEFAULT_BASE_URLS["gemini"]).rstrip("/")
         version_seg = "" if (base.endswith("/v1beta") or base.endswith("/v1")) else "/v1beta"
-        url = f"{base}{version_seg}/models/{self.model_name}:generateContent"
+        effective_model = normalize_ai_model("gemini", self.model_name)
+        url = f"{base}{version_seg}/models/{effective_model}:generateContent"
 
         # Gemini 用 contents（role 仅 user/model），assistant 映射为 model。
         contents: List[Dict[str, Any]] = []

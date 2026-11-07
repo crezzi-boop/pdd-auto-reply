@@ -180,8 +180,19 @@ async function fetchModels() {
   const models = (result && result.models) || []
   modelOptions.value = models.map((m) => ({ id: m.id, name: m.name || m.id }))
   // 当前模型名为空或不在列表中时，默认选中第一个，便于快速确认
-  if (modelOptions.value.length > 0 && !modelOptions.value.some((m) => m.id === form.model_name)) {
-    form.model_name = modelOptions.value[0].id
+  // 已停用的 Gemini 2.x / 3.5 / 3.7 模型、或列表里不存在的模型，自动改选推荐项
+  const current = form.model_name.trim()
+  const deprecated = /^gemini-(1\.5|2\.|3\.5-flash$|3\.7)/.test(current)
+  if (
+    modelOptions.value.length > 0 &&
+    (deprecated || !modelOptions.value.some((m) => m.id === current))
+  ) {
+    const preferred =
+      modelOptions.value.find((m) => m.id === 'gemini-3.8-flash') ||
+      modelOptions.value.find((m) => m.id === 'gemini-3.5-flash-lite') ||
+      modelOptions.value.find((m) => m.id.includes('flash')) ||
+      modelOptions.value[0]
+    form.model_name = preferred.id
   }
   // 获取成功后收起浮层，避免遮挡
   showModelDropdown.value = false
@@ -276,7 +287,7 @@ onMounted(async () => {
               v-model="form.model_name"
               class="field__input model-input-wrap__input"
               type="text"
-              placeholder="如：gpt-4o-mini / qwen-plus，或点击右侧自动获取"
+              placeholder="如：gemini-3.8-flash / gpt-4o-mini / qwen-plus，或点击右侧自动获取"
               @input="onModelInput"
               @focus="onModelFocus"
               @blur="onModelBlur"
@@ -321,6 +332,10 @@ onMounted(async () => {
           {{ modelOptions.length
             ? `已加载 ${modelOptions.length} 个模型，可直接选择或继续手动输入`
             : '可手动输入，或点击右侧按钮获取该服务商支持的模型列表' }}
+        </p>
+        <p v-if="form.provider_type === 'gemini'" class="model-hint" style="color:#b45309">
+          Gemini 2.5 系列已停用，推荐 gemini-3.8-flash（省额度可选 gemini-3.5-flash-lite）；
+          填旧模型名系统会自动改用新模型。
         </p>
       </div>
       <label class="field">

@@ -239,7 +239,95 @@ def _http_post_json(
     return parsed
 
 
+
+# ----------------------------------------------------------------------
+# Gemini 模型生命周期与常见错误的可读化
+# ----------------------------------------------------------------------
+# Google 自 2026-09 起把 2.x 模型限制为「仅历史项目可用」，2026-10-20 正式
+# 弃用 gemini-2.5-flash；新项目调用会返回 HTTP 404。这里统一把已下线模型映射
+# 到当前可用的替代模型，避免「测试连接」和「AI 实际回复」双双失败。
+GEMINI_RECOMMENDED_MODEL: str = "gemini-3.8-flash"
+GEMINI_MODEL_REPLACEMENTS: Dict[str, str] = {
+    "gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash-latest": "gemini-3.5-flash-lite",
+    "gemini-1.5-pro": GEMINI_RECOMMENDED_MODEL,
+    "gemini-1.5-pro-latest": GEMINI_RECOMMENDED_MODEL,
+    "gemini-2.0-flash": "gemini-3.6-flash",
+    "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash": GEMINI_RECOMMENDED_MODEL,
+    "gemini-2.5-pro": GEMINI_RECOMMENDED_MODEL,
+    "gemini-3.5-flash": "gemini-3.6-flash",
+    "gemini-3.7-flash": GEMINI_RECOMMENDED_MODEL,
+}
+
+
+def normalize_ai_model(provider_type: Any, model_name: Any) -> str:
+    """把已下线的 Gemini 模型名规范为当前可用模型（其它协议原样返回）。"""
+    model = clean_ai_text(model_name)
+    if not model:
+        return model
+    if normalize_ai_provider_type(provider_type, "", model) != "gemini":
+        return model
+    # 允许 "models/gemini-xxx" 写法，统一去掉前缀。
+    if model.startswith("models/"):
+        model = model[len("models/"):]
+    return GEMINI_MODEL_REPLACEMENTS.get(model, model)
+
+
+def _validate_gemini_api_key(key: str) -> None:
+    """Gemini 密钥格式自检，尽早给出可操作的中文提示。"""
+    if not key:
+        return  # 缺失由 get_ai_settings_missing_fields 统一处理
+    if any(ch.isspace() for ch in key):
+        raise AiProviderError(
+            "API 密钥里含有空格或换行：请重新复制完整密钥，粘贴时不要带前后空格"
+        )
+    if not key.startswith("AIza") or len(key) < 30:
+        raise AiProviderError(
+            "API 密钥格式不对：Google Gemini 密钥应以 AIza 开头、约 39 位。"
+            "请到 https://aistudio.google.com/apikey 创建并复制完整密钥"
+            "（不要复制项目 ID 或 OAuth 客户端 ID）"
+        )
+
+
+def friendly_ai_error(detail: str, http_code: int = 0) -> str:
+    """把服务商英文报错补上中文原因与处理建议，保留原文便于排查。"""
+    text = clean_ai_text(detail)
+    low = text.lower()
+    hint = ""
+    if "api key not valid" in low or "invalid api key" in low:
+        hint = (
+            "【API 密钥无效】请到 https://aistudio.google.com/apikey 重新创建密钥："
+            "① 复制完整字符串（AIza 开头、约 39 位，别带空格）；"
+            "② 确认该密钥所属项目已启用 Generative Language API；"
+            "③ 刚创建的密钥等 1～2 分钟再试；"
+            "④ 若设置了网站 / IP 白名单限制，请改为无限制。"
+        )
+    elif (
+        "no longer available" in low
+        or "is deprecated" in low
+        or ("not found" in low and "model" in low)
+    ):
+        hint = (
+            "【模型已停用】Google 已停用 Gemini 2.5 系列，新项目无法调用。"
+            "请把模型名改为 gemini-3.8-flash（或更省额度的 gemini-3.5-flash-lite），"
+            "也可点「获取模型」重新选择。"
+        )
+    elif "quota" in low or "rate limit" in low or http_code == 429:
+        hint = "【额度不足】免费额度已用完或触发限流，请稍后再试，或在 Google AI Studio 检查配额。"
+    elif "permission_denied" in low or http_code == 403:
+        hint = "【权限不足】该密钥无权调用 Gemini API，请在 Google Cloud 项目里启用 Generative Language API。"
+    if hint:
+        return "%s（原始信息：%s）" % (hint, text[:160]) if text else hint
+    return text or ("HTTP %s" % http_code)
+
+
 def _extract_http_error(exc: urllib.error.HTTPError) -> str:
+    """提取错误原因并翻译成中文可操作提示（供 GET / POST 共用）。"""
+    return friendly_ai_error(_raw_http_error(exc), getattr(exc, "code", 0))
+
+
+def _raw_http_error(exc: urllib.error.HTTPError) -> str:
     """从 HTTPError 响应体中提取简短错误原因（截断 300 字）。"""
     try:
         raw = exc.read().decode("utf-8")
@@ -381,6 +469,7 @@ def fetch_model_list(
         return _normalize_model_options(data if isinstance(data, list) else [])
 
     if provider == "gemini":
+        _validate_gemini_api_key(key)
         # 经 x-goog-api-key 请求头传递密钥，避免密钥出现在 URL 查询串而随访问
         # 日志 / 异常信息泄漏（也无需对密钥做 URL 编码）。
         url = _build_gemini_url(base_url, "/models")
@@ -399,7 +488,13 @@ def fetch_model_list(
                 or "supportedGenerationMethods" not in item
                 or "generateContent" in item.get("supportedGenerationMethods", [])
             ]
-        return _normalize_model_options(data if isinstance(data, list) else [])
+        options = _normalize_model_options(data if isinstance(data, list) else [])
+        # 已下线模型不展示，避免用户再次选中；推荐模型排在最前。
+        options = [o for o in options if o.get("id") not in GEMINI_MODEL_REPLACEMENTS]
+        options.sort(
+            key=lambda o: (o.get("id") != GEMINI_RECOMMENDED_MODEL, o.get("id", ""))
+        )
+        return options
 
     # openai_compatible：GET {base}/models
     url = f"{normalize_openai_base_url(base_url)}/models"
@@ -450,9 +545,11 @@ def test_ai_connection(
 
     provider = normalize_ai_provider_type(provider_type, base_url, model_name)
     key = clean_ai_text(api_key)
-    model = clean_ai_text(model_name)
+    model = normalize_ai_model(provider, clean_ai_text(model_name))
     prompt = "你好，请回复『测试成功』"
 
+    if provider == "gemini":
+        _validate_gemini_api_key(key)
     if provider == "anthropic":
         return _test_anthropic(base_url, key, model, prompt, timeout)
     if provider == "gemini":
@@ -510,7 +607,8 @@ def _test_gemini(
 ) -> str:
     """测试 Google Gemini 接口（generateContent）。"""
     # 经 x-goog-api-key 请求头传递密钥，避免密钥出现在 URL 查询串而泄漏。
-    url = _build_gemini_url(base_url, f"/models/{model}:generateContent")
+    effective_model = normalize_ai_model("gemini", model)
+    url = _build_gemini_url(base_url, f"/models/{effective_model}:generateContent")
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     payload = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -559,6 +657,10 @@ __all__ = [
     "list_provider_options",
     "get_ai_settings_missing_fields",
     "normalize_openai_base_url",
+    "normalize_ai_model",
+    "GEMINI_RECOMMENDED_MODEL",
+    "GEMINI_MODEL_REPLACEMENTS",
+    "friendly_ai_error",
     "fetch_model_list",
     "test_ai_connection",
 ]
