@@ -35,9 +35,11 @@ from common.models.setting_models import SysDict
 from common.schemas.common import ApiResponse, error_response, success_response
 from common.services.ai_provider_service import (
     AiProviderError,
+    clean_ai_text,
     fetch_model_list,
     get_default_ai_base_url,
     list_provider_options,
+    normalize_ai_api_key,
     normalize_ai_model,
     normalize_ai_provider_type,
     test_ai_connection,
@@ -151,8 +153,8 @@ def save_ai_config(
 
     provider = normalize_ai_provider_type(provider_type, api_base, model_name)
     # API 地址留空时回退该接口类型的默认地址，避免存空导致后续调用缺地址。
-    base = (str(api_base).strip() if api_base else "") or get_default_ai_base_url(provider)
-    raw_model = str(model_name).strip() if model_name else None
+    base = clean_ai_text(api_base) or get_default_ai_base_url(provider)
+    raw_model = clean_ai_text(model_name) or None
     # 保存时即把已下线的 Gemini 模型改写为当前可用模型，避免实际回复失败。
     model = normalize_ai_model(provider, raw_model) if raw_model else None
     instr = str(instructions) if instructions is not None else None
@@ -169,8 +171,10 @@ def save_ai_config(
         "ai_enabled": bool(ai_enabled),
     }
     # 仅当传入了新密钥时才更新密文，留空表示沿用已存密钥（需求 8.6）。
-    if api_key is not None and str(api_key).strip():
-        values["api_key_enc"] = encrypt_text(str(api_key).strip())
+    # 密钥只做粘贴噪声清理，不校验格式（各渠道密钥前缀 / 长度并不统一）。
+    cleaned_key = normalize_ai_api_key(api_key)
+    if cleaned_key:
+        values["api_key_enc"] = encrypt_text(cleaned_key)
 
     if existing is None:
         values["created_by"] = operator_id
@@ -221,12 +225,13 @@ def fetch_models(
         api_base if api_base else (record.api_base if record else None),
         None,
     )
-    base = (str(api_base).strip() if api_base else "") or (
-        (record.api_base if record else None) or get_default_ai_base_url(provider)
-    )
-    key = str(api_key).strip() if api_key else ""
+    base = clean_ai_text(api_base) or clean_ai_text(
+        record.api_base if record else None
+    ) or get_default_ai_base_url(provider)
+    # 密钥不校验格式，仅清理粘贴带入的空白 / 引号等噪声；本次未填则回退库内已存密钥。
+    key = normalize_ai_api_key(api_key)
     if not key and record is not None:
-        key = try_decrypt_text(record.api_key_enc) or ""
+        key = normalize_ai_api_key(try_decrypt_text(record.api_key_enc))
     if not key:
         return error_response(CODE_PARAM_ERROR, "请先填写 API 密钥再获取模型列表")
 
@@ -290,17 +295,17 @@ def test_ai_config(
         api_base if api_base else (record.api_base if record else None),
         model_name if model_name else (record.model_name if record else None),
     )
-    base = (str(api_base).strip() if api_base else "") or (
-        (record.api_base if record else None) or get_default_ai_base_url(provider)
-    )
-    model = (str(model_name).strip() if model_name else "") or (
-        record.model_name if record else ""
+    base = clean_ai_text(api_base) or clean_ai_text(
+        record.api_base if record else None
+    ) or get_default_ai_base_url(provider)
+    model = clean_ai_text(model_name) or clean_ai_text(
+        record.model_name if record else None
     )
 
-    # 密钥：优先本次传入；为空回退库内解密（已存密钥）。
-    key = str(api_key).strip() if api_key else ""
+    # 密钥：优先本次传入；为空回退库内解密（已存密钥）。同样不校验格式，只做清理。
+    key = normalize_ai_api_key(api_key)
     if not key and record is not None:
-        key = try_decrypt_text(record.api_key_enc) or ""
+        key = normalize_ai_api_key(try_decrypt_text(record.api_key_enc))
     if not key:
         return error_response(CODE_PARAM_ERROR, "请先填写 API 密钥再测试")
 

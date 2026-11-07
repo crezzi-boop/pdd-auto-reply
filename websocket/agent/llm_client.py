@@ -112,7 +112,8 @@ class LLMClient:
             provider_type: 接口类型（openai_compatible / anthropic / gemini /
                 dashscope_app）。非 OpenAI 兼容协议走纯对话调用（不含工具）。
         """
-        self.api_key = api_key
+        # 仅去除粘贴 / 换行带入的空白，兼容历史脏数据；不校验密钥格式。
+        self.api_key = "".join(str(api_key or "").split())
         self.api_base = api_base
         self.model_name = model_name
         self.temperature = temperature

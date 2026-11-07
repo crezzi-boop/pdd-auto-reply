@@ -73,6 +73,58 @@ def clean_ai_text(value: Any) -> str:
     return str(value or "").replace("\r", "").replace("\n", "").strip()
 
 
+# 从网页 / 文档 / .env 复制密钥时常见的不可见噪声字符。
+_API_KEY_NOISE: frozenset[str] = frozenset(
+    {"\u200b", "\u200c", "\u200d", "\ufeff", "\u2060"}
+)
+# 成对包裹密钥的引号（英文 / 中文 / 全角）。
+_API_KEY_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("'", "'"),
+    ("`", "`"),
+    ("\u201c", "\u201d"),
+    ("\u2018", "\u2019"),
+    ("\u300c", "\u300d"),
+)
+# .env 形式误粘贴时允许剥掉的键名前缀。
+_API_KEY_ENV_PREFIXES = frozenset(
+    {"API_KEY", "APIKEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "KEY", "TOKEN"}
+)
+
+
+def normalize_ai_api_key(value: Any) -> str:
+    """清理 API 密钥里的粘贴噪声；**不校验、不限制密钥格式**。
+
+    Gemini 密钥在不同获取渠道（AI Studio / Google Cloud / 企业代理 / 第三方网关）
+    生成的前缀与长度并不统一，早期版本按「必须 AIza 开头、约 39 位」做本地白名单
+    判断，会把合法密钥误报为「格式不对」。因此这里只做无损清洗，密钥是否有效
+    一律由服务商接口在「测试连接 / 获取模型 / 实际回复」时判定，并把错误翻译成中文。
+
+    自动去除：所有空白（含空格 / 换行 / 制表符 / 全角空格）、零宽字符与 BOM、
+    成对包裹的引号、``GEMINI_API_KEY=xxx`` 之类误粘贴的键名前缀；其余字符原样保留。
+
+    Args:
+        value: 用户填写或数据库解密出的密钥原始值。
+
+    Returns:
+        清洗后的密钥字符串（可能为空，由调用方判定是否缺失）。
+    """
+    text = "".join(
+        ch
+        for ch in str(value or "")
+        if not ch.isspace() and ch not in _API_KEY_NOISE
+    )
+    for left, right in _API_KEY_QUOTE_PAIRS:
+        if len(text) >= 2 and text.startswith(left) and text.endswith(right):
+            text = text[1:-1]
+            break
+    if "=" in text:
+        prefix, _, tail = text.partition("=")
+        if prefix.upper() in _API_KEY_ENV_PREFIXES and tail:
+            text = tail
+    return text.strip()
+
+
 def normalize_ai_provider_type(
     provider_type: Any = None, base_url: Any = "", model_name: Any = ""
 ) -> str:
@@ -161,7 +213,7 @@ def get_ai_settings_missing_fields(settings: Dict[str, Any] | None) -> List[str]
         payload.get("model_name"),
     )
     base_url = clean_ai_text(payload.get("base_url"))
-    api_key = clean_ai_text(payload.get("api_key"))
+    api_key = normalize_ai_api_key(payload.get("api_key"))
     model_name = clean_ai_text(payload.get("model_name"))
 
     missing: List[str] = []
@@ -247,17 +299,17 @@ def _http_post_json(
 # 弃用 gemini-2.5-flash；新项目调用会返回 HTTP 404。这里统一把已下线模型映射
 # 到当前可用的替代模型，避免「测试连接」和「AI 实际回复」双双失败。
 GEMINI_RECOMMENDED_MODEL: str = "gemini-3.8-flash"
+# 只保留 Google 模型列表中已确认不再返回的 1.5 / 2.0 旧系列。
+# 服务商 models.list 实际会返回哪些模型，取决于密钥所属项目与地区；早期版本
+# 把 2.5 / 3.5 / 3.7 等也写死为「已停用」并强制改写，反而让用户选不到本来可用
+# 的模型。现在一律以服务商返回的真实列表为准，用户填什么就用什么。
 GEMINI_MODEL_REPLACEMENTS: Dict[str, str] = {
-    "gemini-1.5-flash": "gemini-3.5-flash-lite",
-    "gemini-1.5-flash-latest": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash": GEMINI_RECOMMENDED_MODEL,
+    "gemini-1.5-flash-latest": GEMINI_RECOMMENDED_MODEL,
     "gemini-1.5-pro": GEMINI_RECOMMENDED_MODEL,
     "gemini-1.5-pro-latest": GEMINI_RECOMMENDED_MODEL,
     "gemini-2.0-flash": "gemini-3.6-flash",
     "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
-    "gemini-2.5-flash": GEMINI_RECOMMENDED_MODEL,
-    "gemini-2.5-pro": GEMINI_RECOMMENDED_MODEL,
-    "gemini-3.5-flash": "gemini-3.6-flash",
-    "gemini-3.7-flash": GEMINI_RECOMMENDED_MODEL,
 }
 
 
@@ -274,34 +326,26 @@ def normalize_ai_model(provider_type: Any, model_name: Any) -> str:
     return GEMINI_MODEL_REPLACEMENTS.get(model, model)
 
 
-def _validate_gemini_api_key(key: str) -> None:
-    """Gemini 密钥格式自检，尽早给出可操作的中文提示。"""
-    if not key:
-        return  # 缺失由 get_ai_settings_missing_fields 统一处理
-    if any(ch.isspace() for ch in key):
-        raise AiProviderError(
-            "API 密钥里含有空格或换行：请重新复制完整密钥，粘贴时不要带前后空格"
-        )
-    if not key.startswith("AIza") or len(key) < 30:
-        raise AiProviderError(
-            "API 密钥格式不对：Google Gemini 密钥应以 AIza 开头、约 39 位。"
-            "请到 https://aistudio.google.com/apikey 创建并复制完整密钥"
-            "（不要复制项目 ID 或 OAuth 客户端 ID）"
-        )
-
-
 def friendly_ai_error(detail: str, http_code: int = 0) -> str:
     """把服务商英文报错补上中文原因与处理建议，保留原文便于排查。"""
     text = clean_ai_text(detail)
     low = text.lower()
     hint = ""
-    if "api key not valid" in low or "invalid api key" in low:
+    invalid_key_marks = (
+        "api key not valid",
+        "invalid api key",
+        "api_key_invalid",
+        "invalid credential",
+        "unauthenticated",
+    )
+    if any(mark in low for mark in invalid_key_marks):
         hint = (
-            "【API 密钥无效】请到 https://aistudio.google.com/apikey 重新创建密钥："
-            "① 复制完整字符串（AIza 开头、约 39 位，别带空格）；"
+            "【API 密钥无效或被服务商拒绝】系统不限制密钥格式，请依次核对："
+            "① 从 https://aistudio.google.com/apikey 完整复制密钥，不要带引号、空格或换行；"
             "② 确认该密钥所属项目已启用 Generative Language API；"
             "③ 刚创建的密钥等 1～2 分钟再试；"
-            "④ 若设置了网站 / IP 白名单限制，请改为无限制。"
+            "④ 若密钥设置了网站 / IP / API 限制，请暂时改为无限制；"
+            "⑤ 若用第三方中转，请把接口类型改为「OpenAI 兼容」并填对方给的地址。"
         )
     elif (
         "no longer available" in low
@@ -309,9 +353,20 @@ def friendly_ai_error(detail: str, http_code: int = 0) -> str:
         or ("not found" in low and "model" in low)
     ):
         hint = (
-            "【模型已停用】Google 已停用 Gemini 2.5 系列，新项目无法调用。"
-            "请把模型名改为 gemini-3.8-flash（或更省额度的 gemini-3.5-flash-lite），"
-            "也可点「获取模型」重新选择。"
+            "【模型名不可用】该模型对当前密钥不可调用（旧模型可能只对老用户开放，"
+            "或项目无权限；模型列表里出现也不代表一定能调用）。"
+            "请把模型名改为 gemini-flash-lite-latest 后重试，或在「获取模型」里选较新的 flash / latest 类模型。"
+        )
+    elif (
+        http_code == 503
+        or "high demand" in low
+        or "overloaded" in low
+        or "temporarily unavailable" in low
+        or "try again later" in low
+    ):
+        hint = (
+            "【模型当前繁忙】服务商返回 503（请求量高 / 暂时过载），这不是密钥或配置问题。"
+            "请稍等几分钟重试；或把模型名改为 gemini-flash-lite-latest（实测较稳定、更省额度）再测试。"
         )
     elif "quota" in low or "rate limit" in low or http_code == 429:
         hint = "【额度不足】免费额度已用完或触发限流，请稍后再试，或在 Google AI Studio 检查配额。"
@@ -451,7 +506,7 @@ def fetch_model_list(
         AiProviderError: 密钥缺失、不支持的服务商或接口调用失败。
     """
     provider = normalize_ai_provider_type(provider_type, base_url, "")
-    key = clean_ai_text(api_key)
+    key = normalize_ai_api_key(api_key)
     if not key:
         raise AiProviderError("请先填写 API 密钥再获取模型列表")
     if provider == "dashscope_app":
@@ -469,7 +524,6 @@ def fetch_model_list(
         return _normalize_model_options(data if isinstance(data, list) else [])
 
     if provider == "gemini":
-        _validate_gemini_api_key(key)
         # 经 x-goog-api-key 请求头传递密钥，避免密钥出现在 URL 查询串而随访问
         # 日志 / 异常信息泄漏（也无需对密钥做 URL 编码）。
         url = _build_gemini_url(base_url, "/models")
@@ -489,8 +543,8 @@ def fetch_model_list(
                 or "generateContent" in item.get("supportedGenerationMethods", [])
             ]
         options = _normalize_model_options(data if isinstance(data, list) else [])
-        # 已下线模型不展示，避免用户再次选中；推荐模型排在最前。
-        options = [o for o in options if o.get("id") not in GEMINI_MODEL_REPLACEMENTS]
+        # 不再按本地写死的「已停用名单」过滤：以服务商返回的「该密钥实际可用
+        # 模型」为准，仅把推荐模型排在最前，方便快速选择。
         options.sort(
             key=lambda o: (o.get("id") != GEMINI_RECOMMENDED_MODEL, o.get("id", ""))
         )
@@ -544,12 +598,10 @@ def test_ai_connection(
         raise AiProviderError(f"配置不完整，请先补全：{'、'.join(missing)}")
 
     provider = normalize_ai_provider_type(provider_type, base_url, model_name)
-    key = clean_ai_text(api_key)
+    key = normalize_ai_api_key(api_key)
     model = normalize_ai_model(provider, clean_ai_text(model_name))
     prompt = "你好，请回复『测试成功』"
 
-    if provider == "gemini":
-        _validate_gemini_api_key(key)
     if provider == "anthropic":
         return _test_anthropic(base_url, key, model, prompt, timeout)
     if provider == "gemini":
@@ -651,6 +703,7 @@ __all__ = [
     "AI_PROVIDER_DEFAULT_BASE_URLS",
     "AiProviderError",
     "clean_ai_text",
+    "normalize_ai_api_key",
     "normalize_ai_provider_type",
     "get_ai_provider_label",
     "get_default_ai_base_url",
