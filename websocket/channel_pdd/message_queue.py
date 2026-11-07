@@ -33,6 +33,11 @@ logger = logging.getLogger("channel_pdd.message_queue")
 # 队列默认最大容量（防止异常情况下无限堆积导致内存泄漏）。
 DEFAULT_MAX_SIZE: int = 1000
 
+# 队列「已关闭且已取空」时 get() 的让出时长（秒）。
+# 该分支若无 await，消费循环会陷入无等待空转占满 CPU 并饿死整个事件循环
+# （停用 / 重新启用店铺时曾导致 /health 超时、消息收不到），必须让出并限速。
+_CLOSED_EMPTY_YIELD_SECONDS: float = 0.05
+
 
 @dataclass
 class QueuedMessage:
@@ -132,6 +137,9 @@ class FifoMessageQueue:
             队首的 ``QueuedMessage``；当队列已关闭且为空，或等待超时，返回 ``None``。
         """
         if self._closed and self._queue.empty():
+            # 必须 await 一次：否则上层消费循环会无让出地反复拿到 None，
+            # 造成 CPU 100% 空转、事件循环被饿死（服务健康检查超时、收不到消息）。
+            await asyncio.sleep(_CLOSED_EMPTY_YIELD_SECONDS)
             return None
 
         try:
@@ -225,6 +233,12 @@ class MessageQueueManager:
             对应名称的 ``FifoMessageQueue`` 实例。
         """
         queue = self._queues.get(name)
+        # 已关闭的队列不可复用（例如 close_all 后重新启用店铺），否则新连接
+        # 会一直拿到 closed 队列而拒绝入队、消费循环立即退出。
+        if queue is not None and queue.closed:
+            logger.info("队列 %s 已关闭，重建新队列", name)
+            self._queues.pop(name, None)
+            queue = None
         if queue is None:
             queue = FifoMessageQueue(
                 name, max_size if max_size is not None else self._default_max_size

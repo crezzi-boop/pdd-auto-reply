@@ -299,7 +299,10 @@ class LLMClient:
         """Google Gemini 协议纯对话调用（generateContent）。"""
         import httpx
 
-        from common.services.ai_provider_service import AI_PROVIDER_DEFAULT_BASE_URLS
+        from common.services.ai_provider_service import (
+            AI_PROVIDER_DEFAULT_BASE_URLS,
+            normalize_ai_model,
+        )
 
         system_content, turns = self._split_system_and_turns(messages)
         base = (self.api_base or AI_PROVIDER_DEFAULT_BASE_URLS["gemini"]).rstrip("/")

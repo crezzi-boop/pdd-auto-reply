@@ -247,7 +247,13 @@ class PDDChannel:
                 logger.error("消费取消息失败: shop_id=%s, 错误: %s", self.shop_id, exc)
                 continue
             if message is None:
-                # 超时无消息：回到循环顶部检查停止信号。
+                # 队列已关闭且取空：主动退出消费循环。否则会反复拿到 None
+                # 空转占满 CPU，导致 /health 超时、心跳停止、消息无法接收。
+                if self._is_stopped() or bool(
+                    getattr(self.message_queue, "closed", False)
+                ):
+                    return
+                # 普通超时无消息：回到循环顶部检查停止信号。
                 continue
             # 兼容 FifoMessageQueue（QueuedMessage 包装）与裸 payload 两种来源。
             payload = getattr(message, "payload", message)

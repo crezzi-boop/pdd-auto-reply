@@ -91,3 +91,25 @@ sudo docker compose --env-file .env down           # 停止
 `backend/app/services/reply_service.py`、`backend/app/api/routes/replies.py`、
 `websocket/engine/reply_engine.py`、`websocket/engine/message_consumer.py`、
 `frontend/src/components/shop_settings/DefaultReplyPanel.vue`。
+
+## 自动回复整体失效的修复（2026-11-07）
+
+现象：消息进来但不自动回复；关闭 AI 后仍不回复。两个独立原因叠加：
+
+1. **AI 调用必失败**：`websocket/agent/llm_client.py` 的 `_chat_gemini` 调用了
+   `normalize_ai_model`，但函数内只导入了 `AI_PROVIDER_DEFAULT_BASE_URLS`，触发
+   `NameError`，每次 AI 回复都回退默认回复。已补齐导入，真实密钥调用验证通过。
+2. **服务卡死（关 AI 也没回复的真正原因）**：店铺「停用 → 启用」会关闭消息队列，
+   但 `_consume_loop` 在队列「已关闭且为空」时被 `get()` 立即返回 `None` 反复空转，
+   没有任何 `await` 让出事件循环，CPU 100%、`/health` 超时、心跳停止、消息无法接收。
+   修复：`FifoMessageQueue.get()` 该分支 `await asyncio.sleep(0.05)`；`_consume_loop`
+   检测到队列已关闭立即退出；`MessageQueueManager.get_or_create()` 不复用已关闭队列。
+   回归验证：关闭队列的消费循环 0.05s 内退出，事件循环保持可响应。
+
+排查命令（服务器）：
+`docker compose logs websocket | grep -iE "error|traceback|ai_reply_failed"`、
+`curl -m 5 http://127.0.0.1:8090/health`、`docker stats --no-stream pdd_websocket`。
+若 health 超时且 CPU 接近 100%，优先检查消费循环是否有无 `await` 的分支。
+
+涉及文件：`websocket/agent/llm_client.py`、`websocket/channel_pdd/message_queue.py`、
+`websocket/channel_pdd/pdd_channel.py`（只重建 websocket 镜像即可）。
