@@ -76,12 +76,15 @@ sudo docker compose --env-file .env down           # 停止
 
 拼多多会拦截短时间内的重复回复，原系统每店铺只能填一条默认回复。现改为：
 
-- 后台「店铺管理 → 设置 → 默认与商品回复」可手工增删多条默认回复（最多 20 条、单条 ≤1000 字）
+- 后台「店铺管理 → 设置 → 默认与商品回复」为**一个输入框**：多条话术直接粘贴，一条一行
+  （最多 **100 条**、单条 ≤1000 字）；前后端都会按行拆分，空行与重复行自动忽略，页面实时显示条数
 - 可设置「轮换时间」（1-120 分钟，默认 10）：同一店铺在该窗口内每次默认回复换用一条没发过的语句
 - 窗口内语句全部用过后，自动选最久未用的一条并追加不可见的零宽字符变化，保证文本不重复
 - AI 回复失败回退默认回复时同样参与轮换
 - 发送历史落在 `pdd_default_reply_rotation_record` 表，容器重启不丢；过期记录自动清理
 - 新增列 `pdd_default_reply.contents` / `rotate_minutes` 与轮换记录表由 backend 启动自检迁移器自动补齐，历史单条配置无需改动
+- 100 条 JSON 可能超过 MySQL `TEXT` 的 64KB：`contents` 在 MySQL 下声明为 `LONGTEXT`，
+  启动自检迁移器也会自动把历史的 `TEXT` 列幂等扩容为 `LONGTEXT`（不改数据，已是 LONGTEXT 则跳过）
 
 涉及文件：`common/services/default_reply_variants.py`（公共纯逻辑）、
 `websocket/engine/default_reply_rotation.py`（轮换器）、`common/models/reply_models.py`、

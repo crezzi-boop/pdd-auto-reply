@@ -76,9 +76,10 @@ class SaveDefaultReplyRequest(BaseModel):
     """保存默认回复请求体（支持多条语句 + 不重复轮换）。"""
 
     shop_pk: int = Field(..., description="店铺主键 shop.id")
-    content: str = Field("", description="兼容旧版的单条默认回复内容")
+    content: str = Field("", description="兼容旧版的单条默认回复内容（也支持一条一行的多行文本）")
     contents: Optional[List[str]] = Field(
-        None, description="用户手工输入的多条默认回复语句（最多 20 条）"
+        None,
+        description="多条默认回复语句（最多 100 条）；允许把「一条一行」的整段文本作为单个元素传入，后端按行拆分",
     )
     rotate_minutes: int = Field(
         DEFAULT_ROTATE_MINUTES, description="不重复轮换窗口（分钟，1-120，默认 10）"

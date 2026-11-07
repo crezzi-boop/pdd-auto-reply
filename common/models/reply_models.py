@@ -18,6 +18,7 @@ common.models.reply_models —— 回复规则数据表模型
 from __future__ import annotations
 
 from sqlalchemy import BigInteger, Boolean, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from common.models.base import AuditMixin, Base
@@ -92,8 +93,12 @@ class DefaultReply(AuditMixin, Base):
         Boolean, default=False, nullable=False, comment="是否只回复一次（同一客户仅发送一次默认回复）"
     )
     # 多条兜底语句（JSON 数组文本）：为空 / NULL 时回退到 content 单条。
+    # 上限 100 条 × 单条 1000 字，JSON 文本可能超过 MySQL TEXT 的 64KB，
+    # 故 MySQL 下使用 LONGTEXT；其它方言（如 SQLite 单测）仍用普通 Text。
     contents: Mapped[str | None] = mapped_column(
-        Text, nullable=True, comment="多条默认回复语句（JSON 数组文本；为空时按 content 单条处理）"
+        Text().with_variant(LONGTEXT(), "mysql"),
+        nullable=True,
+        comment="多条默认回复语句（JSON 数组文本，最多 100 条；为空时按 content 单条处理）",
     )
     # 不重复轮换窗口（分钟）：同一店铺在该窗口内每次默认回复使用不同语句。
     rotate_minutes: Mapped[int | None] = mapped_column(

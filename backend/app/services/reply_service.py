@@ -195,9 +195,10 @@ def save_default_reply(
 ) -> ApiResponse:
     """保存（upsert）某店铺的多条默认回复配置（需求 7.1 + 多语句轮换）。
 
-    同 ``shop_pk`` 幂等更新而非新建（每店铺仅一条默认回复配置）。新版前端传
-    ``contents`` 多条语句；旧版仅传 ``content`` 单条时自动兼容为一条。语句会
-    去除空行与重复项，最多 20 条、单条最多 1000 字。
+    同 ``shop_pk`` 幂等更新而非新建（每店铺仅一条默认回复配置）。后台页面是
+    「一个输入框、一条一行」，整段文本可按单个元素传入 ``contents``，这里会按
+    换行自动拆成多条；旧版仅传 ``content`` 单条时自动兼容为一条。语句去除空行
+    与重复项，最多 100 条、单条最多 1000 字。
 
     Args:
         session: 数据库会话。
@@ -216,13 +217,19 @@ def save_default_reply(
     if denied is not None:
         return denied
 
-    submitted = contents if contents is not None else [content]
+    # 后台页面为「一个输入框、一条一行」：整段粘贴文本可能作为单个元素提交，
+    # 这里统一按换行展开并去掉空行，保证每条语句独立参与轮换。
+    raw_items = contents if contents is not None else [content]
+    submitted: List[str] = []
+    for item in raw_items:
+        submitted.extend(str(item or "").splitlines())
+    submitted = [line.strip() for line in submitted if line.strip()]
     if len(submitted) > MAX_VARIANTS:
         return error_response(
             CODE_PARAM_ERROR, f"最多可填写 {MAX_VARIANTS} 条默认回复，请删减后再保存"
         )
-    for item in submitted:
-        if item is not None and len(str(item).strip()) > MAX_VARIANT_LENGTH:
+    for line in submitted:
+        if len(line) > MAX_VARIANT_LENGTH:
             return error_response(
                 CODE_PARAM_ERROR, f"单条默认回复不能超过 {MAX_VARIANT_LENGTH} 字"
             )

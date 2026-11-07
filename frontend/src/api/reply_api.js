@@ -13,6 +13,7 @@ export function fetchDefaultReply(shopPk) {
 
 // 保存（upsert）某店铺默认回复配置
 // payload: { shop_pk, contents: string[], content?, rotate_minutes?, enabled?, reply_once? }
+// contents 也支持传单个「一条一行」的整段文本，后端会按换行拆分；最多 100 条。
 export function saveDefaultReply(payload) {
   return put('/default-replies', payload)
 }

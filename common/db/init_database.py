@@ -81,6 +81,7 @@ class MigrationResult:
 
     - created_tables：本次新建的表名列表（已存在的表不在内）；
     - added_columns：本次补齐的列，元素为 ``"表名.列名"``；
+    - upgraded_columns：本次扩容为大文本的列，元素为 ``"表名.列名"``；
     - seeded_rows：本次字典 / 初始数据钩子新增的记录总条数。
 
     幂等判定：``changed`` 为 False 表示本次运行未产生任何结构 / 数据变更
@@ -90,15 +91,17 @@ class MigrationResult:
     created_tables: list[str] = field(default_factory=list)
     added_columns: list[str] = field(default_factory=list)
     added_unique_indexes: list[str] = field(default_factory=list)
+    upgraded_columns: list[str] = field(default_factory=list)
     seeded_rows: int = 0
 
     @property
     def changed(self) -> bool:
-        """本次运行是否产生了任何变更（建表 / 补字段 / 补唯一索引 / 补数据）。"""
+        """本次运行是否产生了任何变更（建表 / 补字段 / 扩容列 / 补唯一索引 / 补数据）。"""
         return bool(
             self.created_tables
             or self.added_columns
             or self.added_unique_indexes
+            or self.upgraded_columns
             or self.seeded_rows
         )
 
@@ -106,11 +109,13 @@ class MigrationResult:
 class SchemaMigrator:
     """启动自检迁移器：建表 / 补字段 / 补字典初始数据，只增不改不删、幂等。
 
-    迁移分三步顺序执行：
+    迁移按顺序执行：
     1. 建缺失表（基于 ``metadata.create_all(checkfirst=True)``）；
     2. 补缺失列（Inspector 比对模型列与实际列，缺失者 ALTER TABLE ADD COLUMN）；
-    3. 同步表注释（比对并补齐已存在表的表注释，仅 MySQL）；
-    4. 补字典 / 初始数据（回调已注册的初始化钩子）。
+    3. 补缺失唯一索引（建前检测历史重复）；
+    4. 历史 TEXT 列扩容为 LONGTEXT（仅 MySQL，默认回复上限 100 条所需）；
+    5. 同步表注释（比对并补齐已存在表的表注释，仅 MySQL）；
+    6. 补字典 / 初始数据（回调已注册的初始化钩子）。
 
     所有步骤均先比对、后变更，已存在的表 / 列 / 数据保持不变，连续运行幂等。
     """
@@ -141,9 +146,11 @@ class SchemaMigrator:
         result.added_columns = self._add_missing_columns()
         # 3) 补缺失唯一索引（建前检测历史重复，有重复则跳过并告警，绝不删数据）
         result.added_unique_indexes = self._add_missing_unique_constraints()
-        # 4) 同步表注释（幂等：仅当注释缺失 / 不一致时 ALTER）
+        # 4) 历史 TEXT 列扩容为 LONGTEXT（默认回复上限 100 条，幂等）
+        result.upgraded_columns = self._upgrade_longtext_columns()
+        # 5) 同步表注释（幂等：仅当注释缺失 / 不一致时 ALTER）
         self._sync_table_comments()
-        # 5) 补字典 / 初始数据
+        # 6) 补字典 / 初始数据
         result.seeded_rows = self._seed_initial_data()
 
         if result.changed:
@@ -245,7 +252,67 @@ class SchemaMigrator:
             connection.execute(ddl)
 
     # ------------------------------------------------------------------
-    # 步骤 3：补缺失唯一索引（只增不改不删、建前检测历史重复 —— 需求 24.5）
+    # 步骤 4：历史 TEXT 列扩容为 LONGTEXT（默认回复上限放宽到 100 条）
+    # ------------------------------------------------------------------
+    # 需要扩容的列（表名, 列名）：仅当数据库实际类型仍是 TEXT / MEDIUMTEXT 时执行。
+    _LONGTEXT_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("pdd_default_reply", "contents"),
+    )
+
+    def _upgrade_longtext_columns(self) -> list[str]:
+        """把历史 TEXT 列扩容为模型声明的 LONGTEXT（仅 MySQL，幂等、不丢数据）。
+
+        默认回复由最多 20 条放宽到 100 条后，多条语句的 JSON 文本可能超过 MySQL
+        TEXT 的 64KB 上限。本方法在列实际类型仍为 TEXT / MEDIUMTEXT 时执行一次
+        ``ALTER TABLE ... MODIFY COLUMN``；已是 LONGTEXT 或非 TEXT 类型则跳过。
+
+        Returns:
+            本次扩容的列列表，元素形如 ``"表名.列名"``。
+        """
+        if self.engine.dialect.name != "mysql":
+            return []
+        inspector = inspect(self.engine)
+        existing_tables = set(inspector.get_table_names())
+        upgraded: list[str] = []
+        for table_name, column_name in self._LONGTEXT_COLUMNS:
+            if table_name not in existing_tables:
+                continue
+            table = self.metadata.tables.get(table_name)
+            if table is None or column_name not in table.columns:
+                continue
+            column = table.columns[column_name]
+            column_info = next(
+                (
+                    col
+                    for col in inspector.get_columns(table_name)
+                    if col["name"] == column_name
+                ),
+                None,
+            )
+            if column_info is None:
+                continue
+            type_name = str(column_info["type"]).upper()
+            if "LONGTEXT" in type_name or "TEXT" not in type_name:
+                continue
+            column_spec = str(
+                CreateColumn(column).compile(dialect=self.engine.dialect)
+            )
+            # MODIFY COLUMN 会覆盖列注释，显式带回去（注释来自模型元数据，非用户输入）。
+            comment = str(column.comment or "").replace("'", "''")
+            if comment and " COMMENT " not in column_spec.upper():
+                column_spec += f" COMMENT '{comment}'"
+            quoted_table = self.engine.dialect.identifier_preparer.format_table(table)
+            ddl = text(f"ALTER TABLE {quoted_table} MODIFY COLUMN {column_spec}")
+            with self.engine.begin() as connection:
+                connection.execute(ddl)
+            upgraded.append(f"{table_name}.{column_name}")
+            logger.info(
+                "启动自检：将字段 %s.%s 扩容为 LONGTEXT", table_name, column_name
+            )
+        return upgraded
+
+    # ------------------------------------------------------------------
+    # 步骤 5：补缺失唯一索引（只增不改不删、建前检测历史重复 —— 需求 24.5）
     # ------------------------------------------------------------------
     def _add_missing_unique_constraints(self) -> list[str]:
         """为已存在的表补建模型中声明、但数据库缺失的唯一约束 / 唯一索引。

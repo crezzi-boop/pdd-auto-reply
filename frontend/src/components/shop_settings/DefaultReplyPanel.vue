@@ -1,12 +1,12 @@
 <!--
   默认与商品专属回复面板（店铺管理「设置」弹窗内嵌，需求 7.1/7.3/7.5）
-  职责：按店铺维度配置多条默认回复（手工增删、10 分钟窗口内轮换不重复），
+  职责：按店铺维度配置多条默认回复（单个输入框、一条一行批量粘贴、10 分钟窗口内轮换不重复），
         并管理商品专属回复 CRUD（绑定 goods_id，后端分页）。
   说明：店铺由父级弹窗经 shopPk 传入；新增/编辑/删除均经统一弹窗（仅关闭按钮关闭，规范 7）；
         用户输入经 SafeHtml 转义（规范 22）、文案全中文（规范 27）。
 -->
 <script setup>
-import { reactive, ref, onMounted } from 'vue'
+import { reactive, ref, computed, onMounted } from 'vue'
 import {
   Loading,
   TableContainer,
@@ -33,17 +33,30 @@ const REPLY_TYPE_OPTIONS = [
 ]
 const REPLY_TYPE_TEXT = { text: '文本', image: '图片' }
 
-// ==================== 默认回复（多条 + 窗口内轮换，需求 7.1） ====================
-const MAX_DEFAULT_REPLIES = 20
+// ===== 默认回复（单个输入框、一条一行批量粘贴 + 窗口内轮换，需求 7.1） =====
+const MAX_DEFAULT_REPLIES = 100
+const MAX_REPLY_LENGTH = 1000
 const defaultLoading = ref(false)
 const defaultSaving = ref(false)
 const defaultReply = reactive({
-  contents: [''],
+  // 页面只保留一个输入框：多条话术直接粘贴进来，一条一行。
+  text: '',
   enabled: true,
   replyOnce: false,
   rotateMinutes: 10,
   exists: false,
 })
+
+// 按行拆分输入框内容：兼容 Windows(\r\n) / Linux(\n) 换行，忽略空行与首尾空格
+function splitDefaultReplyText(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+}
+
+// 当前有效条数（用于页面实时计数）
+const defaultReplyCount = computed(() => splitDefaultReplyText(defaultReply.text).length)
 
 async function loadDefaultReply() {
   if (!props.shopPk) {
@@ -53,17 +66,17 @@ async function loadDefaultReply() {
   try {
     const data = await replyApi.fetchDefaultReply(props.shopPk)
     if (data) {
-      // 新版返回 contents 数组；旧数据（仅 content 单条）自动转为一条，兼容升级。
+      // 后端返回 contents 数组；旧数据（仅 content 单条）自动转为一条，兼容升级。
       const list = Array.isArray(data.contents) && data.contents.length
         ? data.contents
         : [data.content || '']
-      defaultReply.contents = list.map((item) => String(item ?? ''))
+      defaultReply.text = list.map((item) => String(item ?? '')).join('\n')
       defaultReply.enabled = data.enabled !== false
       defaultReply.replyOnce = data.reply_once === true
       defaultReply.rotateMinutes = Number(data.rotate_minutes) || 10
       defaultReply.exists = true
     } else {
-      defaultReply.contents = ['']
+      defaultReply.text = ''
       defaultReply.enabled = true
       defaultReply.replyOnce = false
       defaultReply.rotateMinutes = 10
@@ -76,40 +89,22 @@ async function loadDefaultReply() {
   }
 }
 
-function addDefaultReplyItem() {
-  if (defaultReply.contents.length >= MAX_DEFAULT_REPLIES) {
-    showToast(`最多可填写 ${MAX_DEFAULT_REPLIES} 条默认回复`, TOAST_TYPE.WARNING)
-    return
-  }
-  defaultReply.contents.push('')
-}
-
-function removeDefaultReplyItem(index) {
-  if (defaultReply.contents.length <= 1) {
-    showToast('至少保留一条默认回复', TOAST_TYPE.WARNING)
-    return
-  }
-  defaultReply.contents.splice(index, 1)
-}
-
 async function saveDefaultReply() {
   if (!props.shopPk) {
     showToast('请先选择店铺', TOAST_TYPE.WARNING)
     return
   }
-  const contents = defaultReply.contents
-    .map((item) => String(item || '').trim())
-    .filter(Boolean)
+  const contents = splitDefaultReplyText(defaultReply.text)
   if (contents.length === 0) {
     showToast('请至少填写一条默认回复内容', TOAST_TYPE.WARNING)
     return
   }
   if (contents.length > MAX_DEFAULT_REPLIES) {
-    showToast(`最多可填写 ${MAX_DEFAULT_REPLIES} 条默认回复`, TOAST_TYPE.WARNING)
+    showToast(`最多可填写 ${MAX_DEFAULT_REPLIES} 条默认回复，请删减后再保存`, TOAST_TYPE.WARNING)
     return
   }
-  if (contents.some((item) => item.length > 1000)) {
-    showToast('单条默认回复不能超过 1000 字', TOAST_TYPE.WARNING)
+  if (contents.some((item) => item.length > MAX_REPLY_LENGTH)) {
+    showToast(`单条默认回复不能超过 ${MAX_REPLY_LENGTH} 字`, TOAST_TYPE.WARNING)
     return
   }
   const rotateMinutes = Number(defaultReply.rotateMinutes)
@@ -121,7 +116,7 @@ async function saveDefaultReply() {
   try {
     await replyApi.saveDefaultReply({
       shop_pk: props.shopPk,
-      // content 为兼容旧版接口保留，恒取第一条。
+      // content 为兼容旧版接口保留，恒取第一条；后端同样会按行拆分 contents。
       content: contents[0],
       contents,
       rotate_minutes: rotateMinutes,
@@ -334,53 +329,33 @@ onMounted(async () => {
 
 <template>
   <div class="panel">
-    <!-- 默认回复（多条 + 窗口内轮换不重复） -->
+    <!-- 默认回复（单个输入框，一条一行 + 窗口内轮换不重复） -->
     <section class="block">
       <div class="block__header">
         <h4 class="block__title">默认回复</h4>
-        <span class="block__desc">未命中关键词且未触发 AI 回复时的兜底回复，可填写多条（最多 20 条）。</span>
+        <span class="block__desc">未命中关键词且未触发 AI 回复时的兜底回复，一行一条，最多 100 条。</span>
       </div>
       <div class="block__body">
         <Loading :visible="defaultLoading" text="加载中..." />
         <div class="reply-hint">
           同一店铺在「轮换时间」内每次触发默认回复，会自动换用一条没发过的语句；
           若该时段内所有语句都发过了，系统会选用最早发过的那条并做不可见的轻微变化，
-          尽量避免因重复回复被拼多多拦截。建议填写 3-10 条意思相同但措辞不同的话术。
+          尽量避免因重复回复被拼多多拦截。直接把多条话术粘贴到下面输入框，<strong>一条一行</strong>即可。
         </div>
 
-        <div class="reply-list">
-          <div v-for="(item, index) in defaultReply.contents" :key="index" class="reply-item">
-            <div class="reply-item__header">
-              <span class="reply-item__index">第 {{ index + 1 }} 条</span>
-              <button
-                class="link link--danger"
-                type="button"
-                :disabled="defaultReply.contents.length <= 1"
-                @click="removeDefaultReplyItem(index)"
-              >
-                删除
-              </button>
-            </div>
-            <textarea
-              v-model="defaultReply.contents[index]"
-              class="field__textarea"
-              rows="3"
-              :placeholder="`请输入第 ${index + 1} 条默认回复内容`"
-            ></textarea>
-          </div>
-        </div>
+        <label class="field">
+          <span class="field__label">回复内容（一条一行，可直接批量粘贴）</span>
+          <textarea
+            v-model="defaultReply.text"
+            class="field__textarea reply-textarea"
+            rows="10"
+            :placeholder="'示例：\n您好，客服马上为您处理\n亲，稍等一下哦\n消息收到啦，正在查询中'"
+          ></textarea>
+        </label>
 
         <div class="reply-toolbar">
-          <button
-            class="btn"
-            type="button"
-            :disabled="defaultReply.contents.length >= MAX_DEFAULT_REPLIES"
-            @click="addDefaultReplyItem"
-          >
-            + 添加一条
-          </button>
           <span class="reply-toolbar__count">
-            已填写 {{ defaultReply.contents.filter((x) => String(x || '').trim()).length }} / {{ MAX_DEFAULT_REPLIES }} 条
+            已填写 {{ defaultReplyCount }} / {{ MAX_DEFAULT_REPLIES }} 条（按行计算，单条最多 1000 字）
           </span>
         </div>
 
@@ -545,7 +520,7 @@ onMounted(async () => {
   flex-direction: column;
 }
 
-/* ===== 多条默认回复 ===== */
+/* ===== 默认回复：单框粘贴，一条一行 ===== */
 .reply-hint {
   font-size: 12px;
   line-height: 1.7;
@@ -556,32 +531,16 @@ onMounted(async () => {
   padding: 10px 12px;
   margin-bottom: 14px;
 }
-.reply-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.reply-item {
-  border: 1px solid var(--color-border);
-  border-radius: 6px;
-  padding: 10px 12px 12px;
-}
-.reply-item__header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 8px;
-}
-.reply-item__index {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-text-secondary);
+.reply-textarea {
+  min-height: 200px;
+  line-height: 1.7;
+  resize: vertical;
 }
 .reply-toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin: 12px 0 16px;
+  margin: 8px 0 16px;
 }
 .reply-toolbar__count {
   font-size: 12px;

@@ -31,7 +31,9 @@ DEFAULT_ROTATE_MINUTES: int = 10
 MIN_ROTATE_MINUTES: int = 1
 MAX_ROTATE_MINUTES: int = 120
 # 单个店铺最多可配置的默认回复条数，以及单条最大字符数（防止超长文本拖慢发送）。
-MAX_VARIANTS: int = 20
+# 后台以「一个输入框、一条一行」粘贴录入，故上限放宽到 100 条；对应的
+# pdd_default_reply.contents 列使用 LONGTEXT，避免 JSON 文本超出 TEXT 的 64KB 限制。
+MAX_VARIANTS: int = 100
 MAX_VARIANT_LENGTH: int = 1000
 
 # 零宽字符：仅用于「窗口内语句用尽」时生成肉眼不可见的变化，不改变回复语义。
