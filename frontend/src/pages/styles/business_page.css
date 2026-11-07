@@ -219,6 +219,15 @@
 }
 
 /* ===== 自定义弹窗（新增/编辑），仅关闭按钮关闭（规范 7：遮罩不可关闭） ===== */
+/* 全局 styles/index.css 里 .modal-overlay 带 z-50，会盖住同页弹窗的按钮，
+   用 .modal-root 后代选择器提高优先级，保证表单按钮可正常点击。 */
+.modal-root .modal-overlay {
+  z-index: 0;
+}
+.modal-root .modal-dialog {
+  z-index: 1;
+}
+
 .modal-root {
   position: fixed;
   inset: 0;

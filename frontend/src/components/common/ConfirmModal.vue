@@ -153,6 +153,9 @@ function onOverlayClick() {
 .modal-overlay {
   position: absolute;
   inset: 0;
+  /* 全局 styles/index.css 的 .modal-overlay 带 z-50，会把遮罩盖到弹窗按钮上方，
+     导致「取消 / 确定」点不动。此处显式降为 0，并让弹窗主体抬到 1。 */
+  z-index: 0;
   background: rgba(0, 0, 0, 0.5);
   /* 鼠标在遮罩上显示默认箭头，提示不可点击关闭 */
   cursor: default;
@@ -160,6 +163,7 @@ function onOverlayClick() {
 
 .modal-dialog {
   position: relative;
+  z-index: 1;
   width: 100%;
   max-width: 380px;
   margin: 0 16px;
