@@ -58,3 +58,17 @@ export function importShopByCookie(payload) {
 export function loginShopByPassword(payload) {
   return post('/shops/login-by-password', payload)
 }
+
+// ---------- 扫码登录（系统内置自助：网页里直接显示二维码，扫完自动建店） ----------
+// 启动扫码会话，返回 { session_id, qr_image(data URI), expires_in }
+export function startQrLogin() {
+  return post('/qr-login/start', {})
+}
+// 轮询会话状态，返回 { state, qr_image, message }；state=success 时店铺已自动添加
+export function fetchQrLoginStatus(sessionId) {
+  return get('/qr-login/status', { session_id: sessionId })
+}
+// 关闭弹窗时取消会话，释放服务器浏览器
+export function cancelQrLogin(sessionId) {
+  return post('/qr-login/cancel', { session_id: sessionId })
+}

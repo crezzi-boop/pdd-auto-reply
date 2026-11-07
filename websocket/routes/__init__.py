@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from routes import connections, cookies, login, messages, products
+from routes import connections, cookies, login, messages, products, qr_login
 
 # websocket 服务对外路由聚合器（由 _bootstrap 以 /api/v1 前缀挂载）。
 api_router = APIRouter()
@@ -40,6 +40,9 @@ api_router.include_router(cookies.router)
 
 # 店铺登录接口：账号密码登录 / Cookie 导入并返回店铺信息（需求 4.1 / 4.2 / 4.3 / 4.4）。
 api_router.include_router(login.router)
+
+# 扫码登录会话：网页自助获取二维码、手机扫码确认后自动建店。
+api_router.include_router(qr_login.router)
 
 
 __all__ = ["api_router"]

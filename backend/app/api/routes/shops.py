@@ -27,6 +27,7 @@ backend.app.api.routes.shops —— 拼多多店铺与账号管理接口路由
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -39,7 +40,10 @@ from app.core.business_codes import CODE_FORBIDDEN, MSG_FORBIDDEN
 from app.services import account_service
 from common.db.session import get_db
 from common.models.user_models import SysUser
-from common.schemas.common import ApiResponse, error_response
+from common.schemas.common import ApiResponse, error_response, success_response
+from common.services import service_client
+
+logger = logging.getLogger("backend.api.routes.shops")
 
 # 店铺与账号管理路由：标签「店铺与账号」便于 OpenAPI 文档分组；前缀由聚合层添加。
 router = APIRouter(tags=["店铺与账号"])
@@ -302,6 +306,137 @@ def disable_shop(
     if denied is not None:
         return denied
     return account_service.disable_shop(db, shop_pk, current_user=current_user)
+
+
+
+# ----------------------------------------------------------------------
+# 扫码登录自助会话（系统内置，无需人工发送二维码）
+# ----------------------------------------------------------------------
+_QR_START_PATH: str = "/api/v1/qr-login/start"
+_QR_STATUS_PATH: str = "/api/v1/qr-login/status"
+_QR_CANCEL_PATH: str = "/api/v1/qr-login/cancel"
+# 已完成建店的会话（避免轮询重复落库）与正在建店的会话（避免并发重复落库）。
+_qr_imported_sessions: set[str] = set()
+_qr_importing_sessions: set[str] = set()
+
+
+class QrSessionRequest(BaseModel):
+    """扫码会话请求体。"""
+
+    session_id: str = Field(..., description="扫码会话 ID")
+
+
+@router.post("/qr-login/start", response_model=ApiResponse, summary="生成拼多多扫码登录二维码")
+def start_qr_login(
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """启动 websocket 侧扫码会话，把二维码图片回传给前端展示。"""
+    denied = _ensure_permission(current_user, "create", db)
+    if denied is not None:
+        return denied
+    try:
+        resp = service_client.post_json(
+            service_client.websocket_base_url(), _QR_START_PATH, {}, timeout=40.0
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("启动扫码会话异常：%s", exc)
+        return error_response(-1, "二维码生成失败，请稍后重试")
+    if not resp.ok or not resp.success:
+        return error_response(-1, resp.message or "二维码生成失败，请稍后重试")
+    data = resp.body.get("data") or {}
+    return success_response(
+        data={
+            "session_id": data.get("session_id", ""),
+            "qr_image": data.get("qr_image", ""),
+            "expires_in": data.get("expires_in", 900),
+        },
+        message="二维码已生成",
+    )
+
+
+@router.get("/qr-login/status", response_model=ApiResponse, summary="查询扫码登录状态并自动建店")
+def get_qr_login_status(
+    session_id: str = Query(..., description="扫码会话 ID"),
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """轮询扫码状态；登录成功时用 Cookie 自动新增 / 更新店铺。
+
+    Cookie 仅在 backend 与 websocket 之间传输，不下发浏览器；同一会话只落库一次。
+    """
+    denied = _ensure_permission(current_user, "create", db)
+    if denied is not None:
+        return denied
+    try:
+        resp = service_client.get_json(
+            service_client.websocket_base_url(),
+            _QR_STATUS_PATH,
+            {"session_id": session_id},
+            timeout=20.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return error_response(-1, "查询扫码状态失败：%s" % str(exc)[:100])
+    if not resp.ok or not resp.success:
+        return error_response(-1, resp.message or "会话不存在或已过期，请重新获取二维码")
+    data = resp.body.get("data") or {}
+    state = data.get("state") or "waiting"
+    out = {
+        "state": state,
+        "qr_image": data.get("qr_image", ""),
+        "message": data.get("message", ""),
+    }
+    if state == "success" and session_id not in _qr_imported_sessions:
+        if session_id in _qr_importing_sessions:
+            out.update({"state": "importing", "message": "登录成功，正在添加店铺…"})
+            return success_response(data=out)
+        _qr_importing_sessions.add(session_id)
+        try:
+            result = account_service.import_shop_by_cookie(
+                db,
+                cookies=data.get("cookies") or "",
+                owner_user_id=current_user.id,
+                remark="扫码登录",
+                operator_id=current_user.id,
+            )
+            if result.success:
+                _qr_imported_sessions.add(session_id)
+                out.update({"state": "success", "message": "登录成功，店铺已自动添加"})
+            else:
+                out.update(
+                    {
+                        "state": "failed",
+                        "message": "登录成功但店铺保存失败：%s" % (result.message or "请重试"),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("扫码登录后自动建店异常：%s", exc)
+            out.update({"state": "failed", "message": "店铺保存异常：%s" % str(exc)[:100]})
+        finally:
+            _qr_importing_sessions.discard(session_id)
+    return success_response(data=out)
+
+
+@router.post("/qr-login/cancel", response_model=ApiResponse, summary="取消扫码登录会话")
+def cancel_qr_login(
+    payload: QrSessionRequest,
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """关闭弹窗时取消会话，及时释放服务器浏览器资源。"""
+    denied = _ensure_permission(current_user, "create", db)
+    if denied is not None:
+        return denied
+    try:
+        service_client.post_json(
+            service_client.websocket_base_url(),
+            _QR_CANCEL_PATH,
+            {"session_id": payload.session_id},
+            timeout=10.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("取消扫码会话失败：%s", exc)
+    return success_response(message="已取消")
 
 
 __all__ = ["router"]

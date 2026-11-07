@@ -9,7 +9,7 @@
            加载遮罩 + 转圈、表格固定高度内部滚动、响应式、XSS 防范（SafeHtml）。
 -->
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
 import {
   Loading,
   TableContainer,
@@ -63,6 +63,81 @@ function onStatusChange() {
   page.value = 1
   loadShops()
 }
+
+// -------------------- 扫码登录（系统内置自助登录） --------------------
+const qrVisible = ref(false)
+const qrImage = ref('')
+const qrState = ref('')
+const qrMessage = ref('')
+const qrSessionId = ref('')
+let qrTimer = null
+
+function stopQrPolling() {
+  if (qrTimer) {
+    clearInterval(qrTimer)
+    qrTimer = null
+  }
+}
+
+function closeQrLogin() {
+  stopQrPolling()
+  if (qrSessionId.value) {
+    shopApi.cancelQrLogin(qrSessionId.value).catch(() => {})
+  }
+  qrVisible.value = false
+  qrImage.value = ''
+  qrSessionId.value = ''
+  qrState.value = ''
+}
+
+async function openQrLogin() {
+  stopQrPolling()
+  if (qrSessionId.value) {
+    shopApi.cancelQrLogin(qrSessionId.value).catch(() => {})
+  }
+  qrVisible.value = true
+  qrImage.value = ''
+  qrState.value = 'starting'
+  qrMessage.value = '正在生成二维码…'
+  qrSessionId.value = ''
+  try {
+    const data = await shopApi.startQrLogin()
+    qrSessionId.value = data.session_id || ''
+    qrImage.value = data.qr_image || ''
+    qrState.value = 'waiting'
+    qrMessage.value = '请用手机「拼多多商家版 App」扫一扫，并在手机上点「确认登录」'
+    qrTimer = setInterval(pollQrLogin, 2000)
+  } catch (e) {
+    qrState.value = 'failed'
+    qrMessage.value = '二维码生成失败，请点「重新获取二维码」再试'
+  }
+}
+
+async function pollQrLogin() {
+  if (!qrSessionId.value) return
+  try {
+    const data = await shopApi.fetchQrLoginStatus(qrSessionId.value)
+    if (data.qr_image && data.qr_image !== qrImage.value) qrImage.value = data.qr_image
+    qrState.value = data.state
+    if (data.message) qrMessage.value = data.message
+    if (data.state === 'success') {
+      stopQrPolling()
+      qrVisible.value = false
+      showToast('扫码登录成功，店铺已自动添加', TOAST_TYPE.SUCCESS)
+      page.value = 1
+      await loadShops()
+    } else if (data.state === 'expired' || data.state === 'failed') {
+      stopQrPolling()
+    }
+  } catch (e) {
+    // 请求层已统一提示；轮询继续，避免偶发网络抖动中断扫码
+  }
+}
+
+onBeforeUnmount(() => {
+  stopQrPolling()
+  if (qrSessionId.value) shopApi.cancelQrLogin(qrSessionId.value).catch(() => {})
+})
 
 // -------------------- 新增 / 编辑弹窗 --------------------
 const formVisible = ref(false)
@@ -279,8 +354,9 @@ onMounted(loadShops)
         </div>
       </div>
       <div class="shop-page__actions">
-        <button class="btn btn--primary" type="button" @click="openPasswordLogin">账号密码登录</button>
+        <button class="btn btn--primary" type="button" @click="openQrLogin">扫码登录（推荐）</button>
         <button class="btn btn--default" type="button" @click="openCookieImport">Cookie 导入</button>
+        <button class="btn btn--default" type="button" @click="openPasswordLogin">账号密码登录</button>
       </div>
     </div>
 
@@ -408,6 +484,9 @@ onMounted(loadShops)
             <label class="form__label">登录密码<span class="form__required">*</span></label>
             <input v-model="form.password" class="form__input" type="password" placeholder="拼多多商家后台密码" />
           </div>
+          <p class="form__hint" style="color:#b45309;background:#fffbeb;padding:8px;border-radius:6px">
+            ⚠ 当前服务器没有图形界面，此方式需要人工点验证码 / 滑块，通常会超时失败。请改用「扫码登录」。
+          </p>
           <p class="form__hint">提交后将通过浏览器自动登录获取凭据，若出现验证码 / 滑块请按提示完成验证。</p>
         </template>
 
@@ -431,6 +510,31 @@ onMounted(loadShops)
         </div>
       </div>
     </FormModal>
+
+    <!-- 扫码登录自助弹窗：二维码直接显示在系统网页里，无需人工发图 -->
+    <div v-if="qrVisible" class="qr-mask" @click.self="closeQrLogin">
+      <div class="qr-dialog">
+        <div class="qr-dialog__head">
+          <h3>扫码登录新增店铺</h3>
+          <button type="button" aria-label="关闭" @click="closeQrLogin">×</button>
+        </div>
+        <div class="qr-dialog__body">
+          <p>用手机「拼多多商家版 App」扫一扫下方二维码，然后在手机上点「确认登录」。扫码成功后店铺会自动添加，无需点保存。</p>
+          <div class="qr-box">
+            <img v-if="qrImage" :src="qrImage" alt="拼多多登录二维码" />
+            <span v-else class="qr-loading">二维码生成中…</span>
+          </div>
+          <p
+            class="qr-status"
+            :class="{ 'qr-status--ok': qrState === 'success', 'qr-status--err': qrState === 'failed' || qrState === 'expired' }"
+          >{{ qrMessage }}</p>
+          <div class="qr-actions">
+            <button type="button" @click="openQrLogin">重新获取二维码</button>
+            <button type="button" @click="closeQrLogin">取消</button>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <!-- 停用确认弹窗 -->
     <ConfirmModal
@@ -633,4 +737,55 @@ onMounted(loadShops)
   color: var(--color-text-secondary, #5c6573);
   line-height: 1.5;
 }
+
+/* 扫码登录自助弹窗 */
+.qr-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(15, 23, 42, .55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.qr-dialog {
+  width: 400px;
+  max-width: 100%;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, .25);
+  overflow: hidden;
+}
+.qr-dialog__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid #eef1f6;
+}
+.qr-dialog__head h3 { margin: 0; font-size: 16px; color: #1f2937; }
+.qr-dialog__head button {
+  border: none; background: transparent; font-size: 22px;
+  line-height: 1; cursor: pointer; color: #6b7280;
+}
+.qr-dialog__body { padding: 18px 20px 22px; text-align: center; }
+.qr-dialog__body p { font-size: 13px; color: #5c6573; line-height: 1.6; margin: 0 0 12px; }
+.qr-box {
+  width: 240px; height: 240px; margin: 0 auto 12px;
+  border: 1px solid #e5e9f0; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  background: #fff; overflow: hidden;
+}
+.qr-box img { width: 100%; height: 100%; object-fit: contain; }
+.qr-loading { font-size: 13px; color: #94a3b8; }
+.qr-status { min-height: 20px; font-weight: 500; }
+.qr-status--ok { color: #15803d; }
+.qr-status--err { color: #b91c1c; }
+.qr-actions { display: flex; gap: 10px; justify-content: center; margin-top: 8px; }
+.qr-actions button {
+  padding: 7px 16px; border-radius: 6px; cursor: pointer;
+  border: 1px solid #d7dce5; background: #fff; color: #333; font-size: 13px;
+}
+.qr-actions button:first-child { border-color: #1677ff; color: #1677ff; }
 </style>
