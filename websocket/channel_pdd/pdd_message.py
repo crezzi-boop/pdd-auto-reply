@@ -283,6 +283,7 @@ class BaseMessageHandler:
             "nickname": self.data.get("nickname"),
             "from_role": _safe_get(self.data, "from", "role"),
             "from_uid": _safe_get(self.data, "from", "uid"),
+            "from_cs_uid": _safe_get(self.data, "from", "cs_uid"),
             "to_role": _safe_get(self.data, "to", "role"),
             "to_uid": _safe_get(self.data, "to", "uid"),
             "timestamp": self.data.get("time"),
@@ -311,6 +312,7 @@ class PDDChatMessage:
         self.nickname = basic_info.get("nickname")
         self.from_user = basic_info.get("from_role")
         self.from_uid = basic_info.get("from_uid")
+        self.from_cs_uid = basic_info.get("from_cs_uid")
         self.to_user = basic_info.get("to_role")
         self.to_uid = basic_info.get("to_uid")
         self.timestamp = basic_info.get("timestamp")
@@ -393,6 +395,7 @@ class PDDChatMessage:
             "nickname": self.nickname,
             "from_user": self.from_user,
             "from_uid": self.from_uid,
+            "from_cs_uid": self.from_cs_uid,
             "to_user": self.to_user,
             "to_uid": self.to_uid,
             "timestamp": self.timestamp,

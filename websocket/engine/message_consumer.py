@@ -421,6 +421,12 @@ class MessageConsumer:
                     self._resolve_log_content(context, text),
                     direction=_DIRECTION_OUT,
                 )
+                # 真人客服在拼多多后台 / APP 手动回复客户（from 带 cs_uid 标识，
+                # 区别于本系统经 SendMessage 自动回推的 mall_cs 报文）时，登记人工
+                # 介入状态，使该客户进入「延迟回复」闸门；90 秒强制保底不受影响。
+                # 仅真人手发才登记 —— 系统自动回复的回推不登记，避免自刷新状态。
+                if context.kwargs.get("from_cs_uid"):
+                    manual_session_state.mark(self.shop_pk, customer_uid)
             return ProcessOutcome(handled=False)
 
         # 仅处理客户（role=user）发来的可自动回复类型消息。
