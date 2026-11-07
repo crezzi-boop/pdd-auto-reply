@@ -118,6 +118,7 @@ DICT_SEED_DATA: dict[str, list[DictItem]] = {
         ("email", "邮件", 1),
         ("webhook", "Webhook", 2),
         ("wecom", "企业微信", 3),
+        ("feishu", "飞书机器人", 4),
     ],
     # 消息方向（需求 17.x）
     "msg_direction": [

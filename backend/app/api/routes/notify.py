@@ -81,17 +81,25 @@ class CreateChannelRequest(BaseModel):
     """创建通知渠道请求体（需求 18.1）。"""
 
     shop_pk: int = Field(..., description="归属店铺主键 shop.id（店铺级通知渠道）")
-    channel_type: str = Field(..., description="渠道类型：email/webhook/wecom")
+    channel_type: str = Field(..., description="渠道类型：email/webhook/wecom/feishu")
     target: str = Field(..., description="通知目标地址（邮箱 / Webhook URL 等）")
     enabled: bool = Field(True, description="是否启用")
+    keyword: Optional[str] = Field(
+        None, description="飞书机器人自定义关键词（选填，为空时兜底「提醒」）"
+    )
+    secret: Optional[str] = Field(None, description="飞书机器人签名密钥（选填）")
 
 
 class UpdateChannelRequest(BaseModel):
     """修改通知渠道请求体（需求 18.1 配套；仅更新显式提供字段）。"""
 
-    channel_type: Optional[str] = Field(None, description="渠道类型：email/webhook/wecom")
+    channel_type: Optional[str] = Field(
+        None, description="渠道类型：email/webhook/wecom/feishu"
+    )
     target: Optional[str] = Field(None, description="通知目标地址")
     enabled: Optional[bool] = Field(None, description="是否启用")
+    keyword: Optional[str] = Field(None, description="飞书自定义关键词（空串表示清空）")
+    secret: Optional[str] = Field(None, description="飞书签名密钥（空串表示清空）")
 
 
 class TestChannelRequest(BaseModel):
@@ -135,6 +143,8 @@ def create_channel(
         shop_pk=payload.shop_pk,
         enabled=payload.enabled,
         operator_id=current_user.id,
+        keyword=payload.keyword,
+        secret=payload.secret,
     )
 
 
@@ -160,6 +170,8 @@ def update_channel(
         target=payload.target,
         enabled=payload.enabled,
         operator_id=current_user.id,
+        keyword=payload.keyword,
+        secret=payload.secret,
     )
 
 

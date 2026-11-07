@@ -248,7 +248,7 @@ def test_push_event_single_channel_failure_not_break(
     db_session.commit()
 
     # 打桩：一个渠道抛异常、一个成功，验证异常被兜底不中断。
-    def _fake_send(channel_type, target, content):
+    def _fake_send(channel_type, target, content, **kwargs):
         if channel_type == "webhook":
             raise RuntimeError("模拟渠道异常")
         return True, "发送成功"
@@ -322,3 +322,53 @@ def test_service_test_channel_records_failure(db_session, notify_env, monkeypatc
     record = db_session.query(NotifyRecord).first()
     assert record is not None
     assert record.send_result == notify_service.SEND_RESULT_FAILED
+
+
+# ----------------------------------------------------------------------
+# 飞书机器人专项：官方报文格式 / 自定义关键词 / 响应体业务码
+# ----------------------------------------------------------------------
+def test_feishu_payload_uses_official_format():
+    """飞书必须使用 msg_type + content.text，字符串 content 会被判无关键词。"""
+    payload = notify_service._build_payload("feishu", "【提醒】测试", None)
+    assert payload["msg_type"] == "text"
+    assert payload["content"] == {"text": "【提醒】测试"}
+    wecom = notify_service._build_payload("wecom", "测试", None)
+    assert wecom["text"] == {"content": "测试"}
+
+
+def test_feishu_keyword_auto_prefixed_for_legacy_webhook():
+    """历史 webhook 类型填飞书地址：自动识别并补自定义关键词（幂等）。"""
+    target = "https://open.feishu.cn/open-apis/bot/v2/hook/abc"
+    assert notify_service._resolve_channel_kind("webhook", target) == "feishu"
+    text = notify_service.effective_text("这是一条测试通知", "webhook", target, None)
+    assert text.startswith("【提醒】")
+    assert notify_service.effective_text(text, "webhook", target, "提醒") == text
+    custom = notify_service.effective_text("这是一条测试通知", "feishu", target, "告警")
+    assert custom.startswith("【告警】")
+
+
+def test_feishu_response_body_business_code_checked():
+    """HTTP 200 + code=19024 必须判失败；code=0 判成功。"""
+    ok, detail = notify_service._parse_channel_response(
+        b'{"code":19024,"data":{},"msg":"Key Words Not Found"}', "feishu"
+    )
+    assert ok is False
+    assert "关键词" in detail
+    ok2, _ = notify_service._parse_channel_response(
+        b'{"StatusCode":0,"StatusMessage":"success","code":0,"msg":"success"}',
+        "feishu",
+    )
+    assert ok2 is True
+    ok3, _ = notify_service._parse_channel_response(
+        b'{"errcode":0,"errmsg":"ok"}', "wecom"
+    )
+    assert ok3 is True
+
+
+def test_feishu_sign_payload_contains_timestamp_and_sign():
+    """填写签名密钥时按飞书官方算法附带 timestamp / sign。"""
+    payload = notify_service._build_payload("feishu", "【提醒】测试", "my-secret")
+    assert payload["timestamp"].isdigit()
+    assert len(payload["sign"]) > 10
+    # 关键词与签名互不影响
+    assert payload["content"]["text"] == "【提醒】测试"

@@ -5,7 +5,7 @@
         新增/编辑弹窗仅关闭按钮关闭（规范 7）；用户输入经 SafeHtml 转义（规范 22）、文案全中文（规范 27）。
 -->
 <script setup>
-import { reactive, ref, onMounted } from 'vue'
+import { reactive, ref, computed, onMounted } from 'vue'
 import {
   Loading,
   TableContainer,
@@ -47,7 +47,13 @@ const pageSize = ref(20)
 // 新增 / 编辑弹窗
 const editVisible = ref(false)
 const editingId = ref(null)
-const form = reactive({ channel_type: '', target: '', enabled: true })
+const form = reactive({ channel_type: '', target: '', enabled: true, keyword: '', secret: '' })
+
+// 是否飞书机器人：专用类型，或历史「Webhook」类型但填的是飞书机器人地址
+const isFeishu = computed(() => (
+  form.channel_type === 'feishu' ||
+  /open\.feishu\.cn|open\.larksuite\.com/i.test(form.target || '')
+))
 
 // 渠道类型中文展示
 function channelTypeLabel(key) {
@@ -103,6 +109,8 @@ function openCreate() {
   editingId.value = null
   form.channel_type = channelTypeOptions.value.length > 0 ? channelTypeOptions.value[0].value : ''
   form.target = ''
+  form.keyword = ''
+  form.secret = ''
   form.enabled = true
   editVisible.value = true
 }
@@ -112,6 +120,8 @@ function openEdit(row) {
   editingId.value = row.id
   form.channel_type = row.channel_type
   form.target = row.target
+  form.keyword = row.keyword || ''
+  form.secret = row.secret || ''
   form.enabled = Boolean(row.enabled)
   editVisible.value = true
 }
@@ -134,6 +144,8 @@ async function onConfirm() {
         channel_type: form.channel_type,
         target: form.target.trim(),
         enabled: form.enabled,
+        keyword: form.keyword.trim(),
+        secret: form.secret.trim(),
       })
       showToast('创建成功', TOAST_TYPE.SUCCESS)
       page.value = 1
@@ -142,6 +154,8 @@ async function onConfirm() {
         channel_type: form.channel_type,
         target: form.target.trim(),
         enabled: form.enabled,
+        keyword: form.keyword.trim(),
+        secret: form.secret.trim(),
       })
       showToast('更新成功', TOAST_TYPE.SUCCESS)
     }
@@ -185,7 +199,8 @@ onMounted(async () => {
 
 <template>
   <div class="panel">
-    <p class="panel__desc">配置本店铺的通知渠道（邮件 / Webhook / 企业微信）；连接断开、登录态失效、风控触发等事件将推送至本店铺的已启用渠道。</p>
+    <p class="panel__desc">配置本店铺的通知渠道（邮件 / Webhook / 企业微信 / 飞书机器人）；连接断开、登录态失效、风控触发等事件将推送至本店铺的已启用渠道。</p>
+    <p class="panel__desc">使用飞书机器人时，请选择「飞书机器人」类型并填写群机器人的 Webhook 地址；若飞书后台启用了「自定义关键词」，请把同一个关键词填到「飞书关键词」里（留空默认用「提醒」），否则飞书会拦截消息。</p>
 
     <div class="panel__toolbar">
       <button class="btn btn--primary" type="button" @click="openCreate">新增渠道</button>
@@ -199,6 +214,7 @@ onMounted(async () => {
             <tr>
               <th>渠道类型</th>
               <th>目标地址</th>
+              <th>飞书关键词</th>
               <th>状态</th>
               <th>创建时间</th>
               <th class="col-actions">操作</th>
@@ -208,6 +224,7 @@ onMounted(async () => {
             <tr v-for="row in list" :key="row.id">
               <td>{{ channelTypeLabel(row.channel_type) }}</td>
               <td class="data-table__content"><SafeHtml :content="row.target || '—'" /></td>
+              <td>{{ row.keyword || '—' }}</td>
               <td>
                 <span class="status" :class="row.enabled ? 'status--on' : 'status--off'">
                   {{ row.enabled ? '已启用' : '已停用' }}
@@ -220,7 +237,7 @@ onMounted(async () => {
               </td>
             </tr>
             <tr v-if="!loading && list.length === 0">
-              <td colspan="5" class="empty">暂无通知渠道</td>
+              <td colspan="6" class="empty">暂无通知渠道</td>
             </tr>
           </tbody>
         </table>
@@ -249,8 +266,19 @@ onMounted(async () => {
         </label>
         <label class="field">
           <span class="field__label">目标地址</span>
-          <input v-model="form.target" type="text" class="field__input" placeholder="邮箱 / Webhook URL 等" />
+          <input v-model="form.target" type="text" class="field__input" placeholder="邮箱 / Webhook URL（飞书：https://open.feishu.cn/open-apis/bot/v2/hook/...）" />
         </label>
+        <template v-if="isFeishu">
+          <label class="field">
+            <span class="field__label">飞书关键词（自定义关键词）</span>
+            <input v-model="form.keyword" type="text" class="field__input" placeholder="与飞书机器人安全设置一致，如：提醒（留空默认「提醒」）" />
+            <span class="field__hint">飞书要求消息包含该关键词，系统会自动加到每条通知前面</span>
+          </label>
+          <label class="field">
+            <span class="field__label">飞书签名密钥（选填）</span>
+            <input v-model="form.secret" type="text" class="field__input" placeholder="仅在飞书后台启用「签名校验」时填写" />
+          </label>
+        </template>
         <label class="field field--inline">
           <input v-model="form.enabled" type="checkbox" />
           <span class="field__label">启用该渠道</span>
@@ -269,5 +297,11 @@ onMounted(async () => {
 .modal-form {
   display: flex;
   flex-direction: column;
+}
+.field__hint {
+  margin-top: 4px;
+  font-size: 12px;
+  opacity: 0.68;
+  line-height: 1.5;
 }
 </style>

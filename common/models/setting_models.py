@@ -37,13 +37,22 @@ class NotifyChannel(AuditMixin, Base):
     shop_pk: Mapped[int | None] = mapped_column(
         BigInteger, nullable=True, index=True, comment="归属店铺主键 shop.id（普通列，无外键）"
     )
-    # 渠道类型：email/webhook/wecom（枚举入字典）
+    # 渠道类型：email/webhook/wecom/feishu（枚举入字典）
     channel_type: Mapped[str] = mapped_column(
-        String(32), nullable=False, comment="渠道类型：email/webhook/wecom（枚举入字典）"
+        String(32), nullable=False,
+        comment="渠道类型：email/webhook/wecom/feishu（枚举入字典）"
     )
     # 目标：邮箱地址 / Webhook URL 等（含敏感配置时由设置侧加密，对外脱敏）
     target: Mapped[str | None] = mapped_column(
         String(512), nullable=True, comment="通知目标（邮箱/URL 等）"
+    )
+    # 飞书机器人「自定义关键词」安全设置：发送时自动补到消息文本里（可空兼容历史数据）
+    keyword: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, comment="飞书自定义关键词（选填）"
+    )
+    # 飞书机器人「签名校验」安全设置：开启后按官方算法加签（可空兼容历史数据）
+    secret: Mapped[str | None] = mapped_column(
+        String(256), nullable=True, comment="飞书机器人签名密钥（选填）"
     )
     enabled: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False, comment="是否启用"

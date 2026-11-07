@@ -31,11 +31,16 @@ backend.app.services.notify_service —— 通知渠道与消息通知业务服�
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
@@ -66,7 +71,28 @@ logger = logging.getLogger(__name__)
 DICT_CHANNEL_TYPE: str = "channel_type"
 
 # 合法的通知渠道类型枚举键（与 sys_dict 的 channel_type 字典一致）。
-ALLOWED_CHANNEL_TYPES: tuple[str, ...] = ("email", "webhook", "wecom")
+# feishu 为「飞书机器人」专用类型：按其官方 webhook 报文格式投递，并支持自定义
+# 关键词 / 签名校验（安全设置）。历史以 webhook 类型填写飞书地址的记录，由目标
+# 域名自动识别为飞书渠道，无需用户重新配置。
+ALLOWED_CHANNEL_TYPES: tuple[str, ...] = ("email", "webhook", "wecom", "feishu")
+
+# 飞书 / 企业微信机器人官方 webhook 域名（用于兼容历史 webhook 类型的记录）。
+_FEISHU_HOSTS: tuple[str, ...] = ("open.feishu.cn", "open.larksuite.com")
+_WECOM_HOSTS: tuple[str, ...] = ("qyapi.weixin.qq.com",)
+
+# 飞书机器人未填写关键词时的兜底词：飞书「自定义关键词」安全设置要求消息文本
+# 命中关键词，否则返回 code=19024 且 HTTP 仍为 200（收不到消息却看似成功）。
+# 未配置时统一以「提醒」作为消息前缀，保证开箱可用；用户可在渠道里自行修改。
+FEISHU_FALLBACK_KEYWORD: str = "提醒"
+
+# 飞书常见业务错误码 -> 中文排查提示（HTTP 200 也会带业务失败，必须解析响应体）。
+_FEISHU_ERROR_HINTS: Dict[int, str] = {
+    19024: "消息未包含飞书机器人设置的自定义关键词，请在渠道配置里填写「飞书关键词」",
+    19021: "飞书机器人签名校验失败，请检查「签名密钥」或在飞书后台关闭签名校验",
+    19001: "飞书机器人请求参数不合法，请检查 Webhook 地址与消息格式",
+    9499: "飞书机器人请求格式错误，请确认渠道类型为「飞书机器人」",
+    11246: "飞书机器人频率超限，请稍后重试",
+}
 
 # 系统事件类型与其中文文案（需求 18.3：连接断开 / 登录态失效 / 风控触发）。
 EVENT_CONNECTION_DISCONNECTED: str = "connection_disconnected"
@@ -106,6 +132,8 @@ def serialize_channel(channel: NotifyChannel) -> Dict[str, Any]:
         "shop_pk": channel.shop_pk,
         "channel_type": channel.channel_type,
         "target": channel.target,
+        "keyword": getattr(channel, "keyword", None) or "",
+        "secret": getattr(channel, "secret", None) or "",
         "enabled": bool(channel.enabled),
         "created_at": safe_isoformat(channel.created_at),
         "updated_at": safe_isoformat(channel.updated_at),
@@ -152,23 +180,181 @@ def _write_system_log(session: Session, level: str, content: str) -> None:
     )
 
 
+def _resolve_channel_kind(channel_type: str, target: str) -> str:
+    """识别真实投递协议（飞书 / 企业微信 / 通用 Webhook / 邮件）。
+
+    历史数据常以「webhook」类型填写飞书机器人地址，故除渠道类型外，还按目标
+    URL 的域名自动识别，保证老配置不改动也能按飞书官方报文格式投递。
+
+    Args:
+        channel_type: 渠道配置里的类型键。
+        target: 目标地址。
+
+    Returns:
+        协议标识：feishu / wecom / webhook / email。
+    """
+    ctype = (channel_type or "").strip().lower()
+    host = (urlparse(str(target or "")).hostname or "").lower()
+    if ctype == "email":
+        return "email"
+    if ctype == "feishu" or any(host.endswith(h) for h in _FEISHU_HOSTS):
+        return "feishu"
+    if ctype == "wecom" or any(host.endswith(h) for h in _WECOM_HOSTS):
+        return "wecom"
+    return "webhook"
+
+
+def _compose_text(content: str, keyword: Optional[str]) -> str:
+    """飞书自定义关键词：文本未命中关键词时在开头补关键词前缀（幂等）。
+
+    Args:
+        content: 原通知内容。
+        keyword: 飞书机器人后台设置的自定义关键词。
+
+    Returns:
+        保证命中关键词的文本。
+    """
+    text = str(content or "").strip()
+    kw = str(keyword or "").strip()
+    if kw and kw not in text:
+        return f"【{kw}】{text}"
+    return text
+
+
+def effective_text(
+    content: str,
+    channel_type: str,
+    target: Optional[str],
+    keyword: Optional[str] = None,
+) -> str:
+    """计算真正投递出去的文本，供发送与通知记录保持一致。
+
+    Args:
+        content: 原通知内容。
+        channel_type: 渠道类型。
+        target: 目标地址。
+        keyword: 渠道配置的飞书自定义关键词；为空时用兜底关键词「提醒」。
+
+    Returns:
+        实际投递文本。
+    """
+    if _resolve_channel_kind(channel_type, str(target or "")) == "feishu":
+        kw = str(keyword or "").strip() or FEISHU_FALLBACK_KEYWORD
+        return _compose_text(content, kw)
+    return str(content or "").strip()
+
+
+def _feishu_sign(secret: str, timestamp: int) -> str:
+    """生成飞书机器人签名校验值（HMAC-SHA256 + base64）。
+
+    Args:
+        secret: 飞书机器人后台的签名密钥。
+        timestamp: 当前 Unix 秒级时间戳。
+
+    Returns:
+        签名字符串。
+    """
+    string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
+    digest = hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _build_payload(kind: str, text: str, secret: Optional[str]) -> Dict[str, Any]:
+    """按渠道协议构造官方要求的 JSON 报文。
+
+    - 飞书：``{"msg_type":"text","content":{"text":"..."}}``，开启签名时附带
+      ``timestamp`` / ``sign``；用字符串 ``content`` 会被飞书判为无关键词。
+    - 企业微信：``{"msgtype":"text","text":{"content":"..."}}``。
+    - 通用 Webhook：保持历史兼容的 ``{"content":"..."}``。
+
+    Args:
+        kind: 协议标识（feishu/wecom/webhook）。
+        text: 实际投递文本。
+        secret: 飞书签名密钥；为空时不加签。
+
+    Returns:
+        待序列化的报文字典。
+    """
+    if kind == "feishu":
+        payload: Dict[str, Any] = {
+            "msg_type": "text",
+            "content": {"text": text},
+        }
+        sec = str(secret or "").strip()
+        if sec:
+            ts = int(time.time())
+            payload["timestamp"] = str(ts)
+            payload["sign"] = _feishu_sign(sec, ts)
+        return payload
+    if kind == "wecom":
+        return {"msgtype": "text", "text": {"content": text}}
+    return {"content": text}
+
+
+def _parse_channel_response(raw: bytes, kind: str) -> tuple[bool, str]:
+    """解析渠道响应体的业务码：HTTP 200 不等于投递成功。
+
+    飞书 / 企业微信在关键词不匹配、签名错误等场景仍返回 HTTP 200，仅响应体里的
+    ``code`` / ``StatusCode`` / ``errcode`` 非 0。旧实现只看 HTTP 状态码，导致
+    「页面提示发送成功、群里却收不到」。这里统一翻译为中文排查提示。
+
+    Args:
+        raw: 响应体字节。
+        kind: 协议标识。
+
+    Returns:
+        二元组 (是否成功, 结果描述中文)。
+    """
+    if not raw:
+        return True, "发送成功"
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, TypeError, AttributeError):
+        # 非 JSON 响应（自定义 Webhook）：HTTP 2xx 即视为成功，保持兼容。
+        return True, "发送成功"
+    if not isinstance(data, dict):
+        return True, "发送成功"
+    code = data.get("code", data.get("StatusCode", data.get("errcode", 0)))
+    msg = str(data.get("msg") or data.get("StatusMessage") or data.get("errmsg") or "")
+    try:
+        code_num = int(code)
+    except (TypeError, ValueError):
+        code_num = 0 if code in (None, "", "0") else -1
+    if code_num == 0:
+        return True, "发送成功"
+    if kind == "feishu":
+        hint = _FEISHU_ERROR_HINTS.get(code_num)
+        return False, (
+            f"飞书机器人发送失败（code={code_num}）：{hint or msg or '未知错误'}"
+        )
+    return False, f"渠道返回业务失败（code={code_num}）：{msg or '未知错误'}"
+
+
 def send_via_channel(
-    channel_type: str, target: Optional[str], content: str
+    channel_type: str,
+    target: Optional[str],
+    content: str,
+    *,
+    keyword: Optional[str] = None,
+    secret: Optional[str] = None,
 ) -> tuple[bool, str]:
     """经指定渠道实际发送通知，返回 (是否成功, 结果描述)。
 
     本函数为「实际投递」的统一入口，便于单元测试以打桩替换外部 IO：
-    - webhook / wecom：以 HTTP POST 推送 JSON 文本到目标地址（urllib，短超时）；
-    - email：当前阶段 SMTP 设置由系统设置模块（任务 8.2）提供，此处尚未接入，
-      统一返回失败说明，由调用方记录失败不中断（需求 18.4）。
+    - feishu：飞书官方机器人报文 + 自定义关键词前缀 + 可选签名校验；
+    - wecom：企业微信官方机器人报文；
+    - webhook：通用 JSON 文本 POST（兼容自定义 Webhook）；
+    - email：SMTP 尚未接入，统一返回失败说明（需求 18.4）。
 
-    本函数自身不抛网络异常（捕获后转为失败返回值），保证调用方推送主流程不被
-    打断（需求 18.4 / 26）。
+    投递结果同时校验 HTTP 状态码与响应体业务码（需求 18.4）。本函数自身不抛
+    网络异常，捕获后转为失败返回值，保证调用方推送主流程不被打断。
 
     Args:
-        channel_type: 渠道类型（email/webhook/wecom）。
+        channel_type: 渠道类型（email/webhook/wecom/feishu）。
         target: 目标地址（邮箱 / Webhook URL 等）。
         content: 通知内容（中文）。
+        keyword: 飞书机器人自定义关键词（可选，为空用兜底词「提醒」）。
+        secret: 飞书机器人签名密钥（可选）。
 
     Returns:
         二元组 (是否成功, 结果描述中文)。
@@ -176,31 +362,41 @@ def send_via_channel(
     if not target or not str(target).strip():
         return False, "通知目标地址未配置"
 
-    if channel_type in ("webhook", "wecom"):
-        payload = json.dumps({"content": content}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(
-            str(target).strip(),
-            data=payload,
-            method="POST",
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(
-                request, timeout=_SEND_TIMEOUT_SECONDS
-            ) as resp:
-                status = getattr(resp, "status", resp.getcode())
-                if 200 <= int(status) < 300:
-                    return True, "发送成功"
-                return False, f"渠道返回非 2xx 状态码：{status}"
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            # 网络不可达 / 超时 / 解析错误：转为失败返回，绝不向上抛出。
-            return False, f"渠道发送失败：{exc}"
-
-    if channel_type == "email":
+    url = str(target).strip()
+    kind = _resolve_channel_kind(channel_type, url)
+    if kind == "email":
         # SMTP 设置由系统设置模块（任务 8.2）提供，此处尚未接入。
         return False, "邮件渠道尚未配置 SMTP，暂无法发送"
 
-    return False, f"不支持的渠道类型：{channel_type}"
+    text = effective_text(content, channel_type, url, keyword)
+    payload = _build_payload(kind, text, secret)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_SEND_TIMEOUT_SECONDS) as resp:
+            status = int(getattr(resp, "status", None) or resp.getcode() or 0)
+            raw = resp.read()
+            if not 200 <= status < 300:
+                detail = raw.decode("utf-8", errors="replace")[:200]
+                return False, f"渠道返回非 2xx 状态码：{status} {detail}".strip()
+            return _parse_channel_response(raw, kind)
+    except urllib.error.HTTPError as exc:
+        # HTTPError 属于 URLError 子类，需先单独捕获以读取错误响应体。
+        try:
+            raw = exc.read()
+        except Exception:  # noqa: BLE001 兜底：读不到响应体不影响失败返回
+            raw = b""
+        _, detail = _parse_channel_response(raw, kind)
+        suffix = "" if detail == "发送成功" else f"：{detail}"
+        return False, f"渠道返回 HTTP {exc.code}{suffix}"
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        # 网络不可达 / 超时 / 解析错误：转为失败返回，绝不向上抛出。
+        return False, f"渠道发送失败：{exc}"
 
 
 def _record_send(
@@ -289,6 +485,8 @@ def create_notify_channel(
     shop_pk: Optional[int] = None,
     enabled: bool = True,
     operator_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    secret: Optional[str] = None,
 ) -> ApiResponse:
     """创建通知渠道并持久化（需求 18.1）。
 
@@ -299,6 +497,8 @@ def create_notify_channel(
         shop_pk: 归属店铺主键（店铺级渠道必填）。
         enabled: 是否启用，默认启用。
         operator_id: 操作人用户 ID，作为创建人审计字段。
+        keyword: 飞书机器人自定义关键词（选填，为空时兜底「提醒」）。
+        secret: 飞书机器人签名密钥（选填）。
 
     Returns:
         统一响应体：成功返回 data=渠道信息；失败返回对应中文提示。
@@ -321,6 +521,8 @@ def create_notify_channel(
         shop_pk=int(shop_pk),
         channel_type=channel_type,
         target=str(target).strip(),
+        keyword=(str(keyword).strip() or None) if keyword is not None else None,
+        secret=(str(secret).strip() or None) if secret is not None else None,
         enabled=bool(enabled),
         created_by=operator_id,
     )
@@ -338,6 +540,8 @@ def update_notify_channel(
     target: Optional[str] = None,
     enabled: Optional[bool] = None,
     operator_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    secret: Optional[str] = None,
 ) -> ApiResponse:
     """修改通知渠道字段（需求 18.1 配套）。
 
@@ -350,6 +554,8 @@ def update_notify_channel(
         target: 新目标地址；None 表示不修改。
         enabled: 新启停用状态；None 表示不修改。
         operator_id: 操作人用户 ID，用于店铺归属数据范围隔离（需求 3.7）。
+        keyword: 飞书自定义关键词；None 表示不修改，空串表示清空。
+        secret: 飞书签名密钥；None 表示不修改，空串表示清空。
 
     Returns:
         统一响应体：成功返回更新后的渠道信息。
@@ -377,6 +583,10 @@ def update_notify_channel(
         values["target"] = str(target).strip()
     if enabled is not None:
         values["enabled"] = bool(enabled)
+    if keyword is not None:
+        values["keyword"] = str(keyword).strip() or None
+    if secret is not None:
+        values["secret"] = str(secret).strip() or None
 
     if not values:
         return error_response(CODE_PARAM_ERROR, "未提供任何待更新字段")
@@ -470,12 +680,24 @@ def test_notify_channel(
         return denied
 
     test_content = (content or "").strip() or "这是一条测试通知"
-    ok, detail = send_via_channel(channel.channel_type, channel.target, test_content)
+    keyword = getattr(channel, "keyword", None)
+    secret = getattr(channel, "secret", None)
+    # 飞书渠道会自动补自定义关键词，通知记录里保存真正发出去的文本，便于核对。
+    sent_text = effective_text(
+        test_content, channel.channel_type, channel.target, keyword
+    )
+    ok, detail = send_via_channel(
+        channel.channel_type,
+        channel.target,
+        test_content,
+        keyword=keyword,
+        secret=secret,
+    )
     record = _record_send(
         session,
         channel_id=channel.id,
         event_type=None,
-        content=test_content,
+        content=sent_text,
         ok=ok,
         detail=detail,
         shop_pk=channel.shop_pk,
@@ -485,6 +707,7 @@ def test_notify_channel(
         "channel_id": channel.id,
         "send_result": record.send_result,
         "detail": detail,
+        "content": sent_text,
     }
     if ok:
         return success_response(data=result_data, message="测试通知已发送")
@@ -546,9 +769,18 @@ def push_system_event(
     failed_count = 0
     for channel in channels:
         # 单渠道发送以兜底方式执行，异常转为失败记录，绝不中断其它渠道（需求 18.4）。
+        keyword = getattr(channel, "keyword", None)
+        secret = getattr(channel, "secret", None)
+        sent_text = effective_text(
+            content, channel.channel_type, channel.target, keyword
+        )
         try:
             ok, detail = send_via_channel(
-                channel.channel_type, channel.target, content
+                channel.channel_type,
+                channel.target,
+                content,
+                keyword=keyword,
+                secret=secret,
             )
         except Exception as exc:  # noqa: BLE001 兜底：任何异常均不得中断推送主流程
             ok, detail = False, f"渠道发送异常：{exc}"
@@ -557,7 +789,7 @@ def push_system_event(
             session,
             channel_id=channel.id,
             event_type=event_type,
-            content=content,
+            content=sent_text,
             ok=ok,
             detail=detail,
             shop_pk=channel.shop_pk,
@@ -657,8 +889,10 @@ __all__ = [
     "EVENT_TYPE_LABELS",
     "SEND_RESULT_SUCCESS",
     "SEND_RESULT_FAILED",
+    "FEISHU_FALLBACK_KEYWORD",
     "serialize_channel",
     "serialize_record",
+    "effective_text",
     "send_via_channel",
     "create_notify_channel",
     "update_notify_channel",
