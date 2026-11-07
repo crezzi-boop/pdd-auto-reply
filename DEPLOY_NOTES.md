@@ -113,3 +113,43 @@ sudo docker compose --env-file .env down           # 停止
 
 涉及文件：`websocket/agent/llm_client.py`、`websocket/channel_pdd/message_queue.py`、
 `websocket/channel_pdd/pdd_channel.py`（只重建 websocket 镜像即可）。
+
+## 飞书机器人通知修复（2026-11-07）
+
+现象：通知渠道填飞书 Webhook，点「测试发送」提示成功，群里却收不到。三个原因叠加：
+
+1. **报文格式不对**：旧代码对 webhook/wecom 一律 POST `{"content":"文本"}`；飞书官方要求
+   `{"msg_type":"text","content":{"text":"文本"}}`，企业微信要求
+   `{"msgtype":"text","text":{"content":"文本"}}`。格式错误时飞书按「无关键词」拒绝。
+2. **自定义关键词**：飞书后台安全设置要求消息文本命中关键词（本例「提醒」），默认测试
+   文案「这是一条测试通知」不含关键词，飞书返回 `code=19024 Key Words Not Found`。
+3. **只看 HTTP 状态码**：飞书业务失败也返回 HTTP 200（仅响应体 code≠0），旧代码记为
+   success，出现「页面成功、群里没消息」的假成功（历史记录 id=4/5/6 即此类）。
+
+修复内容：
+
+- 新增渠道类型 `feishu`（中文「飞书机器人」）；按渠道类型或目标域名自动识别协议，
+  历史以 webhook 类型填飞书地址的记录无需改动即按飞书格式投递
+- 渠道表新增 `keyword`（自定义关键词）、`secret`（签名密钥）两列，启动自检迁移器自动补列；
+  关键词为空时兜底「提醒」，发送前自动加 `【关键词】` 前缀（幂等，已含则不加）
+- 可选签名校验：`HMAC-SHA256(timestamp+"\n"+secret)` 的 base64，随报文带 timestamp/sign
+- 解析响应体 `code` / `StatusCode` / `errcode`，非 0 判失败并给中文排查提示
+  （19024 关键词、19021 签名、19001 参数、9499 格式）
+- 前端新增「飞书关键词」「飞书签名密钥」输入框（仅飞书渠道显示），通知记录保存实际发出的文本
+- 现有渠道 id=1 已改为 `channel_type=feishu`、`keyword=提醒`
+
+验证：`/api/v1/notify/channels/1/test` 返回 success、飞书 `code=0`；系统事件推送
+success=1 / failed=0；`backend/tests/test_notify_api.py` 13 项回归全部通过；6 容器健康。
+
+涉及文件：`backend/app/services/notify_service.py`、`backend/app/api/routes/notify.py`、
+`backend/tests/test_notify_api.py`、`common/models/setting_models.py`、
+`common/services/dict_seed_data.py`、
+`frontend/src/components/shop_settings/NotifyChannelsPanel.vue`（需重建 backend + frontend 镜像）。
+
+注意：服务器推送 GitHub 备份必须显式指定 deploy key（文件名非 ssh 默认名，
+不指定会报 `Permission denied (publickey)`）：
+
+```bash
+GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519_github_backup -o IdentitiesOnly=yes" \
+  git push backup HEAD:refs/heads/deploy-oci
+```
