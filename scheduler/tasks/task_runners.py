@@ -37,6 +37,7 @@ from tasks.constants import (
     TASK_COOKIE_REFRESH,
     TASK_LOG_FILE_CLEANUP,
     TASK_PRODUCT_SYNC,
+    TASK_REPLY_GUARD,
 )
 
 # 模块级日志记录器（禁用 debug 级别 —— 规范 38）。
@@ -231,11 +232,33 @@ def run_log_file_cleanup() -> None:
         task_run_log.write_failed(TASK_LOG_FILE_CLEANUP, f"文件日志清理失败：{exc}")
 
 
+def run_reply_guard() -> None:
+    """回复保底扫描任务执行体（每 10 秒触发，硬约束、不可关闭）。
+
+    经 HTTP 触发 websocket 服务扫描「最后一条是客户消息且 90 秒内无任何商家
+    回复」的会话并强制发一条默认回复。扫描与判定在 scheduler 独立进程计时，
+    发送由 websocket 服务完成（拼多多消息发送能力只在 websocket 镜像内）。
+
+    本任务**不写 task_run_log**：10 秒一轮会迅速撑爆执行日志表，故仅在失败时
+    输出 logger 警告，成功且无兜底动作时静默；可由 websocket 服务日志核对。
+    自身不抛异常，避免影响调度器存活（需求 26）。
+    """
+    try:
+        result = service_client.trigger_reply_guard_scan()
+        if not result.ok:
+            logger.warning("回复保底扫描调用失败：%s", result.message)
+    except Exception as exc:  # noqa: BLE001 - 单轮失败不得影响调度器
+        logger.error("回复保底扫描任务异常：%s", exc)
+
+
 # 任务键 -> 执行体 的映射，供 SchedulerService 按 scheduled_task.task_key 注册。
+# reply_guard 也在表内，但由 SchedulerService 启动时以固定间隔内置注册，
+# 不依赖 scheduled_task 表配置，保证「保底不可关闭」。
 TASK_RUNNERS = {
     TASK_COOKIE_REFRESH: run_cookie_refresh,
     TASK_PRODUCT_SYNC: run_product_sync,
     TASK_LOG_FILE_CLEANUP: run_log_file_cleanup,
+    TASK_REPLY_GUARD: run_reply_guard,
 }
 
 
@@ -243,5 +266,6 @@ __all__ = [
     "run_cookie_refresh",
     "run_product_sync",
     "run_log_file_cleanup",
+    "run_reply_guard",
     "TASK_RUNNERS",
 ]

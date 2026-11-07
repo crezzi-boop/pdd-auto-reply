@@ -29,6 +29,7 @@ from channel_pdd.api.get_chat_history import GetChatHistory
 from channel_pdd.api.get_conversations import GetConversations
 from channel_pdd.api.send_message import SendMessage
 from common.schemas.common import ApiResponse, error_response, success_response
+from engine.manual_session_state import manual_session_state
 
 logger = logging.getLogger("websocket.routes.messages")
 
@@ -72,6 +73,10 @@ async def send_message(payload: SendMessageRequest) -> ApiResponse:
         return error_response(-1, "消息发送失败，请稍后重试")
 
     if result is not None:
+        # 在线聊天页人工发送成功：按「店铺 + 客户」登记人工介入，刷新该客户的
+        # 自动恢复计时。此后该客户的消息先让客服有先手窗口，机器延迟回复；
+        # 90 秒强制保底仍由独立的回复保底扫描保证，不受本状态影响。
+        manual_session_state.mark(payload.shop_pk, payload.recipient_uid)
         logger.info(
             "手动消息已下发: shop_id=%s, customer=%s",
             payload.shop_id,

@@ -153,3 +153,83 @@ success=1 / failed=0；`backend/tests/test_notify_api.py` 13 项回归全部通�
 GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519_github_backup -o IdentitiesOnly=yes" \
   git push backup HEAD:refs/heads/deploy-oci
 ```
+
+## 回复保底与人工介入（2026-11-07）
+
+背景：拼多多 8:00-23:00 考核「3 分钟人工回复率」，同一消费者当日任意一条消息
+未在 3 分钟内被回复即计入「未回复」。人工接入后若机器人完全静默，客户最后
+一条消息会直接拉低回复率并可能触发罚款。用户确认：本系统以商家客服账号发出的
+机器回复也算人工回复，因此兜底用默认回复即可，无需真人补刀。
+
+硬约束（**不可配置、不可关闭**）：
+
+- 客户消息发出后 **90 秒**仍无任何商家消息 → 强制发一条轮换过的默认回复。
+  90 秒触发 + 10 秒扫描周期 + 发送重试余量，端到端约 90~110 秒，短于用户
+  要求的 2 分钟，也稳在平台 3 分钟红线内。
+- scheduler 服务每 10 秒触发一次（启动时内置注册 `reply_guard` job，
+  **不写 `scheduled_task` 表、不开放启停**），实际发送经 websocket 服务
+  `POST /api/v1/guard/scan` 完成。scheduler 镜像只含 common + scheduler，
+  拼多多发送能力仅在 websocket 镜像内，故采用「独立进程计时 + HTTP 触发发送」。
+- 判重不建表：复用 `pdd_chat_message` 的 in/out 序列。每条 in 消息落库、每次
+  自动回复 / 手动发送 / 保底发送成功后都落库一条 out；会话最新一条是 in
+  即等价于「这条客户消息还没有回复」，保底发出后最新变 out 自然销账。
+- 保底完全绕开 `default_reply_once`、风控限频、非营业时间、过滤 / 黑名单、
+  AI 异常、转人工关键词直接 return 等所有会「不回复」的分支。
+- 安全边界：只回补最近 10 分钟消息（防重启后群发历史会话）、单轮最多 50 个
+  会话、停用店铺不发送、发送前二次确认最新消息未变（防与自动回复重复）、
+  发送失败释放轮换名额并进入 60 秒冷却。
+
+可配项（转人工设置面板顶部，按店铺存于 `pdd_sys_setting`，**秒为单位**）：
+
+- `manual_delay_seconds`：人工介入后机器延迟回复，默认 30 秒，0~60。
+- `manual_recover_seconds`：人工介入自动恢复时长，默认 120 秒，30~3600，
+  0 = 不自动恢复。按「店铺 + 客户」独立计时，从最后一次人工消息起算，客服
+  每回一句刷新计时；两个秒值前后端均做范围校验。
+- 接口：`GET/PUT /api/v1/shops/{shop_pk}/reply-guard`。
+- 人工介入登记：转人工关键词命中且转移成功、在线聊天页手动发送成功。状态存
+  websocket 进程内存（`ManualSessionState`），容器重启丢失最多让相关客户提前
+  回到立即回复，不影响保底。
+
+涉及文件：`common/services/reply_guard_settings.py`（新）、
+`websocket/engine/manual_session_state.py`（新）、`websocket/routes/guard.py`（新）、
+`websocket/engine/message_consumer.py`、`websocket/routes/messages.py`、
+`websocket/routes/__init__.py`、`scheduler/tasks/{constants,task_runners,service_client,scheduler_service}.py`、
+`backend/app/api/routes/transfer.py`、
+`frontend/src/api/auto_reply_api.js`、
+`frontend/src/components/shop_settings/TransferPanel.vue`、
+`websocket/tests/test_reply_guard.py`（新）、
+`websocket/tests/test_message_consumer.py`（补测试隔离桩）。
+需重建 **backend + websocket + scheduler + frontend** 四个镜像。
+
+### 上线验证（2026-11-07 17:10）
+
+- 四容器 healthy；scheduler 内置 `reply_guard` job 每 10 秒调用
+  `POST /api/v1/guard/scan`（5 分钟内 30 次，全部 200），接口返回
+  `deadline_seconds=90`。
+- 真实链路端到端跑通：日志出现两次「保底回复已发送」并落库一条
+  `direction=out`（触发源为测试假会话，详见下方「测试隔离」），证明
+  扫描 → 轮换选句 → 拼多多发送 → 落库销账整条链路可用。
+- `GET/PUT /api/v1/shops/{shop_pk}/reply-guard` 默认值 30/120 秒正确；
+  延迟 61 秒、恢复 29 秒均返回中文校验错误；0/0 合法。
+- 前端产物已包含「人工介入自动恢复时长」等新文案。
+- 单测：`websocket/tests` 全量 **221 passed**（新增 39 项 +
+  回归 182 项），`py_compile` 全部通过。
+
+### 测试隔离（重要，勿回退）
+
+`websocket/tests/test_message_consumer.py` 原先未注入轮换器 / 聊天落库桩，
+跑测试会直接读写**生产库**：一是轮换记录互相污染导致用例偶发失败，二是
+写入 `cust_1` / `cust_A` / `cust_B` 假会话，被 10 秒一次的保底扫描当成
+「超时未回复」而真的向拼多多发起发送。已补齐 `StubRotator`、
+`chat_message_writer`、`chat_history_reader` 三个桩；修复后重跑全量测试，
+`pdd_chat_message` 行数不变（60 条）、假客户行数为 0。
+
+清理记录：上线验证期间产生的 49 条假聊天记录、3 条假会话、4 条假轮换
+记录已删除，清理前整表快照存于
+`~/pdd-backups/guard_test_cleanup_20261107.sql`（**含业务数据，切勿提交 git**）。
+剩余客户 UID 均为真实数字 UID，未误发真实客户。
+
+### 运行依赖
+
+websocket 容器默认未装 `hypothesis` / `pytest`，跑全量测试前需在容器内执行
+`pip install -q pytest hypothesis`（仅测试需要，不写入镜像依赖）。

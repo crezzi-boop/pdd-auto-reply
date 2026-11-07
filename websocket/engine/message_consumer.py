@@ -66,9 +66,11 @@ from common.services.default_reply_variants import (
     decode_variants,
     normalize_rotate_minutes,
 )
+from common.services.reply_guard_settings import load_config_for_runtime
 from common.utils.time_utils import now_beijing, now_beijing_naive
 from engine.default_reply_rotation import DefaultReplyRotator, RotationChoice
 from engine.keyword_matcher import REPLY_IMAGE, REPLY_TEXT
+from engine.manual_session_state import manual_session_state
 from engine.reply_engine import (
     ACTION_AI,
     ACTION_BLACKLISTED,
@@ -485,6 +487,41 @@ class MessageConsumer:
         if self._should_transfer(text, runtime.transfer_keywords):
             return await self._do_transfer(customer_uid, text)
 
+        # 2.5) 人工介入延迟闸门：按「店铺 + 客户」独立判断。人工介入期间先给客服
+        # 一个先手窗口；窗口结束若客服已回复（该会话最新消息为 out）则取消机器
+        # 自动回复，否则照常进入原有决策链。无论本闸门如何判定，90 秒强制保底
+        # 都由独立的 websocket.routes.guard 扫描保证，不受任何业务开关影响。
+        guard_config = load_config_for_runtime(self.shop_pk)
+        delay_seconds = manual_session_state.pending_delay(
+            self.shop_pk,
+            customer_uid,
+            guard_config["manual_recover_seconds"],
+            guard_config["manual_delay_seconds"],
+        )
+        if delay_seconds > 0:
+            logger.info(
+                "人工介入中，延迟自动回复: shop_id=%s, 客户=%s, 延迟=%s秒",
+                self.shop_id,
+                customer_uid,
+                delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+            if self._last_direction_is_out(customer_uid):
+                logger.info(
+                    "人工已回复，取消机器自动回复: shop_id=%s, 客户=%s",
+                    self.shop_id,
+                    customer_uid,
+                )
+                self._write_message_log(
+                    customer_uid, log_content, "manual_replied", None
+                )
+                return ProcessOutcome(
+                    handled=True,
+                    action="manual_replied",
+                    replied=False,
+                    log_result="manual_replied",
+                )
+
         # 3) 注入运行时回复频率计数（供风控判定，需求 13.2）
         runtime.shop_config.session_reply_times = list(
             self._session_reply_times.get(str(customer_uid), [])
@@ -833,6 +870,10 @@ class MessageConsumer:
             customer_uid,
             getattr(result, "success", False),
         )
+        # 转移成功才登记人工介入（转移失败时仍由机器人 / 保底兜底，不静默）。
+        # 登记只刷新该客户的自动恢复计时，不影响其它客户，也不影响 90 秒保底。
+        if getattr(result, "success", False):
+            manual_session_state.mark(self.shop_pk, customer_uid)
         # transfer_to_human 内部已记消息日志；此处仅汇报结果
         return ProcessOutcome(
             handled=True,
@@ -1017,6 +1058,43 @@ class MessageConsumer:
     # ------------------------------------------------------------------
     # 聊天记录落库与会话历史读取（需求 14 / 17：在线聊天与 AI 会话上下文）
     # ------------------------------------------------------------------
+    def _last_direction_is_out(self, customer_uid: Any) -> bool:
+        """判断该客户会话最新一条消息是否为商家发出（out）。
+
+        供人工介入延迟闸门在等待结束后做二次检查：若客服或系统已经回复过，
+        则取消本次机器自动回复，避免与人工抢答 / 重复发送。与强制保底扫描
+        采用同一判重口径（会话最新一条消息的方向）。
+
+        Args:
+            customer_uid: 客户 UID。
+
+        Returns:
+            最新一条为 out 返回 True；无记录 / 最新为 in / 查询失败返回 False
+            （失败时按「尚未回复」处理，让决策链继续，另有 90 秒保底兜底）。
+        """
+        if customer_uid is None:
+            return False
+
+        def _do(session: Any) -> bool:
+            stmt = (
+                select(ChatMessage.direction)
+                .where(
+                    ChatMessage.shop_pk == self.shop_pk,
+                    ChatMessage.customer_uid == str(customer_uid),
+                )
+                .order_by(ChatMessage.id.desc())
+                .limit(1)
+            )
+            return session.execute(stmt).scalar() == _DIRECTION_OUT
+
+        try:
+            return bool(run_in_session(_do))
+        except Exception as exc:  # noqa: BLE001 - 查询失败不中断回复
+            logger.error(
+                "查询最新消息方向失败: shop_id=%s, %s", self.shop_id, exc
+            )
+            return False
+
     def _record_inbound_message(
         self, context: Context, customer_uid: Any, text: Optional[str]
     ) -> None:

@@ -60,6 +60,20 @@ class StubSender:
         return {"success": True}
 
 
+class StubRotator:
+    """默认回复轮换器桩：禁用轮换，避免测试读写生产库轮换记录造成相互污染。
+
+    ``pick`` 返回 None 时消费器回退到配置里的单条默认回复，正好是这些
+    用例要断言的行为；``release`` 为空操作。
+    """
+
+    def pick(self, shop_pk, variants, rotate_minutes):
+        return None
+
+    def release(self, choice):
+        return None
+
+
 class StubTransferService:
     """转人工 / 商品卡片服务桩。"""
 
@@ -160,9 +174,14 @@ def _make_consumer(runtime, sender=None, transfer=None):
         runtime_loader=lambda shop_pk: runtime,
         sender=sender or StubSender(),
         transfer_service=transfer or StubTransferService(),
+        default_reply_rotator=StubRotator(),
         log_writer=lambda v: msg_logs.append(v),
         risk_log_writer=lambda v: risk_logs.append(v),
         notifier=lambda e, c: notifies.append((e, c)),
+        # 聊天落库 / 历史读取也用桩：否则假客户消息会写进生产库，
+        # 并被 90 秒保底扫描当成真实未回复会话误发。
+        chat_message_writer=lambda v: None,
+        chat_history_reader=lambda shop_pk, uid, limit: [],
     )
     return consumer, msg_logs, risk_logs, notifies
 
@@ -306,6 +325,9 @@ def test_default_reply_once_records_and_skips_second_time():
         risk_log_writer=lambda v: None,
         default_reply_record_reader=lambda shop_pk, uid: (shop_pk, uid) in sent_records,
         default_reply_record_writer=lambda shop_pk, uid: sent_records.add((shop_pk, uid)),
+        default_reply_rotator=StubRotator(),
+        chat_message_writer=lambda v: None,
+        chat_history_reader=lambda shop_pk, uid, limit: [],
     )
 
     # 第一条：未命中关键词/AI，走默认回复并发送、登记记录
@@ -339,6 +361,9 @@ def test_default_reply_once_independent_per_customer():
         risk_log_writer=lambda v: None,
         default_reply_record_reader=lambda shop_pk, uid: (shop_pk, uid) in sent_records,
         default_reply_record_writer=lambda shop_pk, uid: sent_records.add((shop_pk, uid)),
+        default_reply_rotator=StubRotator(),
+        chat_message_writer=lambda v: None,
+        chat_history_reader=lambda shop_pk, uid, limit: [],
     )
 
     a = _run(consumer.consume_raw(_raw_text("你好", from_uid="cust_A")))

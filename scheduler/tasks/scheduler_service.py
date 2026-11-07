@@ -35,11 +35,13 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from common.db.repository import Repository, run_with_retry
 from common.models.task_models import ScheduledTask
+from common.services.reply_guard_settings import GUARD_SCAN_INTERVAL_SECONDS
 
 from tasks.constants import (
     SCHEDULE_TYPE_CRON,
     SCHEDULE_TYPE_INTERVAL,
     SUPPORTED_TASK_KEYS,
+    TASK_REPLY_GUARD,
 )
 from tasks.task_runners import TASK_RUNNERS
 
@@ -87,6 +89,22 @@ class SchedulerService:
             return len(self._scheduler.get_jobs())
 
         registered = self._load_and_register()
+
+        # 内置硬约束任务：客户消息回复保底扫描。不读 scheduled_task 表、不开放
+        # 配置与启停，保证「90 秒内必有一条默认回复」不会被任何设置关掉。
+        # 扫描计时跑在 scheduler 独立进程，不依赖 websocket 的消息消费队列；
+        # 实际发送经 HTTP 由 websocket 服务完成。
+        self._scheduler.add_job(
+            TASK_RUNNERS[TASK_REPLY_GUARD],
+            trigger=IntervalTrigger(
+                seconds=GUARD_SCAN_INTERVAL_SECONDS, timezone="Asia/Shanghai"
+            ),
+            id=TASK_REPLY_GUARD,
+            name="客户消息回复保底扫描（内置，不可关闭）",
+            replace_existing=True,
+        )
+        registered += 1
+
         self._scheduler.start()
         self._started = True
         logger.info("定时任务调度器已启动，注册任务 %d 个", registered)

@@ -43,6 +43,10 @@ _RETRY_BACKOFF: float = 2.0
 _COOKIE_REFRESH_PATH: str = "/api/v1/cookies/refresh"
 # backend 服务「商品同步」接口相对路径（与 backend products 路由约定一致）。
 _PRODUCT_SYNC_PATH: str = "/api/v1/products/sync"
+# websocket 服务「回复保底扫描」接口相对路径（每 10 秒触发一次）。
+_GUARD_SCAN_PATH: str = "/api/v1/guard/scan"
+# 保底扫描单次调用超时（秒）：高频任务须短超时，避免重试拖垮调度线程。
+_GUARD_SCAN_TIMEOUT_SECONDS: float = 20.0
 
 
 @dataclass
@@ -160,8 +164,29 @@ def trigger_product_sync(shop_pk: int) -> CallResult:
     return _to_call_result(response)
 
 
+def trigger_reply_guard_scan() -> CallResult:
+    """经 HTTP 触发 websocket 服务执行一次回复保底扫描。
+
+    与 Cookie 刷新 / 商品同步不同，本任务每 10 秒触发一次，故：
+    - 不使用 ``_post_with_retry``（重试 + 退避会拖长单次执行、造成任务堆积）；
+    - 使用较短超时，失败只记日志，下一轮 10 秒后自然会再试。
+    APScheduler 的 ``max_instances=1`` 保证同一时刻只有一轮扫描在跑。
+
+    Returns:
+        规整后的 ``CallResult``。
+    """
+    response = service_client.post_json(
+        service_client.websocket_base_url(),
+        _GUARD_SCAN_PATH,
+        {},
+        timeout=_GUARD_SCAN_TIMEOUT_SECONDS,
+    )
+    return _to_call_result(response)
+
+
 __all__ = [
     "CallResult",
     "trigger_cookie_refresh",
     "trigger_product_sync",
+    "trigger_reply_guard_scan",
 ]

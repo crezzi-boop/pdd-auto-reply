@@ -26,11 +26,16 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core import permission
-from app.core.business_codes import CODE_FORBIDDEN, MSG_FORBIDDEN
+from app.core.business_codes import (
+    CODE_FORBIDDEN,
+    CODE_PARAM_ERROR,
+    MSG_FORBIDDEN,
+)
 from app.services import transfer_service
 from common.db.session import get_db
 from common.models.user_models import SysUser
-from common.schemas.common import ApiResponse, error_response
+from common.schemas.common import ApiResponse, error_response, success_response
+from common.services import reply_guard_settings
 
 # 转人工设置路由：标签便于 OpenAPI 文档分组；前缀由聚合层添加。
 router = APIRouter(tags=["转人工设置"])
@@ -75,6 +80,17 @@ class UpdateStatusRequest(BaseModel):
     enabled: bool = Field(..., description="True=启用，False=停用（下一条消息生效）")
 
 
+class ReplyGuardRequest(BaseModel):
+    """人工介入与回复保底设置请求体（两个秒值，按店铺保存）。"""
+
+    manual_delay_seconds: int = Field(
+        ..., description="人工介入后机器延迟回复秒数（0~60）"
+    )
+    manual_recover_seconds: int = Field(
+        ..., description="人工介入自动恢复秒数（30~3600，0=不自动恢复）"
+    )
+
+
 # ----------------------------------------------------------------------
 # 客服列表（需求 16.1）
 # ----------------------------------------------------------------------
@@ -95,6 +111,57 @@ def list_cs_list(
     return transfer_service.list_cs_list(
         db, shop_pk=shop_pk, operator_id=current_user.id
     )
+
+
+# ----------------------------------------------------------------------
+# 人工介入与回复保底设置（按店铺的两个秒值）
+# ----------------------------------------------------------------------
+@router.get(
+    "/shops/{shop_pk}/reply-guard",
+    response_model=ApiResponse,
+    summary="查询某店铺的人工介入延迟与自动恢复秒数",
+)
+def get_reply_guard(
+    shop_pk: int,
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """查询回复保底设置；未配置时返回默认值（延迟 30 秒 / 自动恢复 120 秒）。"""
+    denied = _ensure_permission(current_user, "view", db)
+    if denied is not None:
+        return denied
+    data = reply_guard_settings.load_config(db, shop_pk)
+    data["guard_deadline_seconds"] = reply_guard_settings.GUARD_DEADLINE_SECONDS
+    return success_response(data=data, message="查询成功")
+
+
+@router.put(
+    "/shops/{shop_pk}/reply-guard",
+    response_model=ApiResponse,
+    summary="保存某店铺的人工介入延迟与自动恢复秒数",
+)
+def save_reply_guard(
+    shop_pk: int,
+    payload: ReplyGuardRequest,
+    current_user: SysUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApiResponse:
+    """保存两个秒值；前后端均校验，越界返回中文错误提示。"""
+    denied = _ensure_permission(current_user, "update", db)
+    if denied is not None:
+        return denied
+    try:
+        data = reply_guard_settings.save_config(
+            db,
+            shop_pk,
+            payload.manual_delay_seconds,
+            payload.manual_recover_seconds,
+            operator_id=current_user.id,
+        )
+    except ValueError as exc:
+        return error_response(CODE_PARAM_ERROR, str(exc))
+    data["guard_deadline_seconds"] = reply_guard_settings.GUARD_DEADLINE_SECONDS
+    return success_response(data=data, message="回复保底设置已保存")
 
 
 # ----------------------------------------------------------------------

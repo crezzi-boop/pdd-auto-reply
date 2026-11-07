@@ -22,8 +22,13 @@ TASK_COOKIE_REFRESH: str = "cookie_refresh"
 TASK_PRODUCT_SYNC: str = "product_sync"
 # 文件日志清理：按保留天数仅清理磁盘日志文件（数据库业务日志表禁止物理删除）。
 TASK_LOG_FILE_CLEANUP: str = "log_file_cleanup"
+# 客户消息回复保底扫描：硬约束任务，保证任何客户消息 90 秒内有商家回复。
+# 该任务由 SchedulerService 启动时「内置注册」，不写入 scheduled_task 表、不开放
+# 配置与启停（保底不可关闭），因此不加入下方 SUPPORTED_TASK_KEYS。
+TASK_REPLY_GUARD: str = "reply_guard"
 
 # 全部受支持的任务键集合（用于校验配置中的 task_key 是否可调度）。
+# 仅包含「由 scheduled_task 表配置驱动」的任务；内置任务 reply_guard 不在此列。
 SUPPORTED_TASK_KEYS: frozenset[str] = frozenset(
     {TASK_COOKIE_REFRESH, TASK_PRODUCT_SYNC, TASK_LOG_FILE_CLEANUP}
 )
@@ -49,6 +54,7 @@ __all__ = [
     "TASK_COOKIE_REFRESH",
     "TASK_PRODUCT_SYNC",
     "TASK_LOG_FILE_CLEANUP",
+    "TASK_REPLY_GUARD",
     "SUPPORTED_TASK_KEYS",
     "SCHEDULE_TYPE_CRON",
     "SCHEDULE_TYPE_INTERVAL",

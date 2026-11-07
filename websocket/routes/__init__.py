@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from routes import connections, cookies, login, messages, products, qr_login
+from routes import connections, cookies, guard, login, messages, products, qr_login
 
 # websocket 服务对外路由聚合器（由 _bootstrap 以 /api/v1 前缀挂载）。
 api_router = APIRouter()
@@ -43,6 +43,9 @@ api_router.include_router(login.router)
 
 # 扫码登录会话：网页自助获取二维码、手机扫码确认后自动建店。
 api_router.include_router(qr_login.router)
+
+# 回复保底扫描：由 scheduler 每 10 秒触发，保证客户消息在 90 秒内有商家回复。
+api_router.include_router(guard.router)
 
 
 __all__ = ["api_router"]

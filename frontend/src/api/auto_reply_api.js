@@ -130,3 +130,15 @@ export function createTransferKeyword(payload) {
 export function setTransferKeywordStatus(keywordId, enabled) {
   return put(`/transfer-keywords/${keywordId}/status`, { enabled })
 }
+
+// ======================== 人工介入与回复保底设置 ========================
+
+// 查询某店铺的两个秒值；未配置时后端返回默认值（延迟 30 秒 / 自动恢复 120 秒）。
+export function getReplyGuard(shopPk) {
+  return get(`/shops/${shopPk}/reply-guard`)
+}
+
+// 保存两个秒值。payload: { manual_delay_seconds, manual_recover_seconds }
+export function saveReplyGuard(shopPk, payload) {
+  return put(`/shops/${shopPk}/reply-guard`, payload)
+}
