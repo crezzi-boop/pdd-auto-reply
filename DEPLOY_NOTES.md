@@ -233,3 +233,10 @@ GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519_github_backup -o IdentitiesOnly=ye
 
 websocket 容器默认未装 `hypothesis` / `pytest`，跑全量测试前需在容器内执行
 `pip install -q pytest hypothesis`（仅测试需要，不写入镜像依赖）。
+
+## 线上修复（2026-11-07 18:10）：人工介入后机器仍秒回客户
+
+- 现象：人工在拼多多后台手发消息后，客户再发消息机器仍秒回，未按设置延迟。
+- 根因：consume_raw 的 mall_cs 分支只转发展示、未登记人工介入；pdd_message 未提取 from.cs_uid，无法区分真人手发与系统回推。
+- 修复：pdd_message.py 透传 from_cs_uid；message_consumer.py 在客服消息含 cs_uid 时 mark 人工介入；process() 第 501 行 pending_delay 据此延迟自动回复。系统自动回推（mall_cs 无 cs_uid）不 mark，避免自刷新。
+- 验证：容器内 test_human_intervention_mark.py 2 passed；websocket 容器 17:35 重建后 Up healthy、代码已编译进镜像；提交 aaee8fd → backup/deploy-oci。
